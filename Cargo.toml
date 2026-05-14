@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Face authentication system for Linux using OpenVINO/ONNX"
 license = "MIT"
-authors = ["Your Name <you@example.com>"]
+authors = ["Vlad Wild <ya.vlash1@yandex.ru>"]
 
 [dependencies]
 opencv = { version = "0.98.2", default-features = false, features = ["clang-runtime", "imgproc", "videoio", "objdetect"] }

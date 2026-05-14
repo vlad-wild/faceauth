@@ -1,8 +1,8 @@
-# PAM example for faceauth (see Linux pam_exec(8))
+# Example of PAM for faceauth (see Linux pam_exec(8))
 #
-# Важно: строки в /etc/pam.d/* НЕ проходят через shell — подстановка $USER НЕ
-# выполняется. Либо укажите пользователя явно: -u myname
-# Либо не передавайте -u: pam_exec передаёт дочернему процессу PAM_USER (Linux-PAM).
+# Important: lines in /etc/pam.d/* DO NOT pass through the USER's shell support
+# is in progress. I can ask the user.: -what is my name
+# I'm not transmitting -you: pam_exec transmits PAM_USER (Linux-PAM) to another user.
 #
 # auth [success=2 default=ignore] pam_exec.so quiet /usr/local/bin/faceauth-auth
-# auth [success=1 default=bad] pam_unix.so try_first_pass nullok
+# auth [success=1 default=error] pam_unix.so try_first_pass is reset to zero
