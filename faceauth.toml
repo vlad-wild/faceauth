@@ -1,0 +1,24 @@
+[video]
+device_path = "/dev/video2"
+timeout = 8
+dark_threshold = 99.0
+certainty = 3.5
+max_height = 480.0
+rotate = 0
+exposure = -1
+ir_mode = true
+
+[detection]
+model_path = "models/ultra_light_640.onnx"
+use_cnn = false
+confidence_threshold = 0.7
+
+[recognition]
+model_path = "models/MobileFaceNet.onnx"
+embedding_size = 128
+distance_threshold = 0.6
+
+[debug]
+end_report = false
+save_failed = false
+save_successful = false
