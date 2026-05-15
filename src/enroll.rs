@@ -71,6 +71,7 @@ pub enum EnrollMerge {
     AppendVariant,
 }
 
+#[derive(Clone)]
 pub struct EnrollParams {
     pub username: String,
     pub label: Option<String>,
