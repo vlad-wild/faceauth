@@ -1,6 +1,6 @@
 # Maintainer: Vlad Wild <ya.vlash1@yandex.ru>
 pkgname=faceauth
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Face authentication system for Linux using OpenCV/ONNX"
 arch=('x86_64' 'aarch64')
