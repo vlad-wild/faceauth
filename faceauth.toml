@@ -9,12 +9,12 @@ exposure = -1
 ir_mode = true
 
 [detection]
-model_path = "models/ultra_light_640.onnx"
+model_path = "/etc/faceauth/models/ultra_light_640.onnx"
 use_cnn = false
 confidence_threshold = 0.7
 
 [recognition]
-model_path = "models/MobileFaceNet.onnx"
+model_path = "/etc/faceauth/models/MobileFaceNet.onnx"
 embedding_size = 128
 distance_threshold = 0.6
 
