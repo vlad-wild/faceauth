@@ -12,6 +12,7 @@ use opencv::prelude::{MatTraitConst, MatTraitConstManual};
 use faceauth::camera::Camera;
 use faceauth::config::Config;
 use faceauth::enroll::{self, EnrollMerge, EnrollParams};
+use faceauth::logger;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiEnrollMode {
@@ -98,7 +99,7 @@ struct FaceauthUi {
 
 impl FaceauthUi {
     fn new() -> (Self, Task<Message>) {
-        let _ = env_logger::try_init();
+        let _ = logger::try_init_from_env();
         let (base_config, config_source) = enroll::load_enrollment_config();
         let username = std::env::var("USER").unwrap_or_default();
         let device = base_config.video.device_path.clone();

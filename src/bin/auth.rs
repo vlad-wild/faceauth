@@ -9,7 +9,7 @@ use faceauth::camera;
 use faceauth::config::Config;
 use faceauth::database::{Database, get_user_model_path};
 use faceauth::detection::HaarCascadeDetector;
-use faceauth::logger::{log_error, log_info, log_warning};
+use faceauth::logger;
 use faceauth::recognition::FaceRecognizer;
 
 #[derive(Parser)]
@@ -54,20 +54,21 @@ fn resolve_pam_username(cli_user: Option<String>) -> Result<String, String> {
 }
 
 fn main() -> Result<()> {
+    logger::init_from_env();
     let args = Args::parse();
     if args.verbose {
-        log_info("Verbose output enabled");
+        log::info!("Verbose output enabled");
     }
 
     let user = match resolve_pam_username(args.user) {
         Ok(u) => u,
         Err(msg) => {
-            log_error(&msg);
+            log::error!("{}", msg);
             std::process::exit(10);
         }
     };
 
-    log_info(&format!("Starting face authentication for user {}", user));
+    log::info!("Starting face authentication for user {}", user);
 
     // Load configuration
     let config = Config::load(&args.config).context("Failed to load config")?;
@@ -76,7 +77,7 @@ fn main() -> Result<()> {
     let model_path = get_user_model_path(&user)?;
     let db = Database::load(&model_path)?;
     if db.get_user(&user).is_none() {
-        log_error(&format!("No face model found for user {}", user));
+        log::error!("No face model found for user {}", user);
 
         std::process::exit(10); // Howdy uses exit code 10 for missing model
     }
@@ -93,7 +94,7 @@ fn main() -> Result<()> {
     }
 
     if config.video.ir_mode {
-        log_info("IR mode: darkness filter disabled; use the same IR device for enrollment");
+        log::info!("IR mode: darkness filter disabled; use the same IR device for enrollment");
     }
 
     let haar_neighbors = if config.video.ir_mode { 2 } else { 3 };
@@ -120,7 +121,7 @@ fn main() -> Result<()> {
         let (color, gray) = match camera.read_frame() {
             Ok(frames) => frames,
             Err(e) => {
-                log_warning(&format!("Failed to read frame: {}", e));
+                log::warn!("Failed to read frame: {}", e);
                 continue;
             }
         };
@@ -143,7 +144,7 @@ fn main() -> Result<()> {
         let faces = match detector.detect(&color) {
             Ok(faces) => faces,
             Err(e) => {
-                log_warning(&format!("Detection error: {}", e));
+                log::warn!("Detection error: {}", e);
                 continue;
             }
         };
@@ -159,7 +160,7 @@ fn main() -> Result<()> {
             let embedding = match recognizer.extract(&crop) {
                 Ok(emb) => emb,
                 Err(e) => {
-                    log_warning(&format!("Embedding extraction failed: {}", e));
+                    log::warn!("Embedding extraction failed: {}", e);
                     continue;
                 }
             };
@@ -167,7 +168,7 @@ fn main() -> Result<()> {
             // Verify against user's model
             let distance = db.verify(&user, &embedding, certainty_threshold as f32);
             if distance {
-                log_info(&format!("Authentication successful for {}", user));
+                log::info!("Authentication successful for {}", user);
                 std::process::exit(0);
             } else {
                 // Update lowest certainty
@@ -180,9 +181,9 @@ fn main() -> Result<()> {
     }
 
     // Timeout or no match
-    log_error(&format!("Authentication failed for {}", user)); // general failure
+    log::error!("Authentication failed for {}", user); // general failure
     if dark_tries == valid_frames {
-        log_error("All frames were too dark"); // "All frames were too dark"
+        log::error!("All frames were too dark"); // "All frames were too dark"
         std::process::exit(13); // exit code 13
     }
     std::process::exit(11); // exit code 11

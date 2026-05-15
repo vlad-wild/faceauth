@@ -15,7 +15,6 @@ toml = "0.8"
 clap = { version = "4.0", features = ["derive"] }
 anyhow = "1.0"
 log = "0.4"
-env_logger = "0.11"
 image = "0.25"
 walkdir = "2.5"
 config = "0.14"
@@ -43,5 +42,3 @@ path = "src/bin/faceauth-ui.rs"
 
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1

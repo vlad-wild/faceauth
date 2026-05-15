@@ -109,7 +109,7 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
+    faceauth::logger::init_from_env();
     let cli = Cli::parse();
 
     match cli.command {
