@@ -305,7 +305,7 @@ impl eframe::App for FaceauthUiApp {
             }
 
             ui.separator();
-            ui.label(format!("Статус: {}", self.status));
+            ui.label(format!("Status: {}", self.status));
             if self.enrolling && self.enroll_tot > 0 {
                 let p = self.enroll_cur as f32 / self.enroll_tot as f32;
                 ui.add(egui::ProgressBar::new(p).show_percentage());
