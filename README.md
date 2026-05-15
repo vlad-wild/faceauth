@@ -84,7 +84,7 @@ FaceAuth can be installed by building from source or via PKGBUILD (AUR).
 
 2. Clone the repo and build:
    ```bash
-   git clone https://github.com/yourusername/faceauth.git
+   git clone https://github.com/vlad-wild/faceauth.git
    cd faceauth
    cargo build --release
    ```
