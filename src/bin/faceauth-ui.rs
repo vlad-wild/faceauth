@@ -198,7 +198,7 @@ impl eframe::App for FaceauthUiApp {
 
             ui.separator();
             ui.label("How to save shots:");
-            ui.radio_value(&mut self.enroll_mode, UiEnrollMode::ReplaceAll, "Заменить всю модель (как раньше)");
+            ui.radio_value(&mut self.enroll_mode, UiEnrollMode::ReplaceAll, "Replace the entire model");
             ui.radio_value(
                 &mut self.enroll_mode,
                 UiEnrollMode::AppendPrimary,
