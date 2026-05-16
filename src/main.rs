@@ -292,6 +292,7 @@ fn test_auth(user: &str, timeout_override: Option<u32>, ir: bool) -> Result<()> 
     let mut cam = camera::Camera::open(&cfg.video.device_path, cfg.video.max_height, cfg.video.rotate)?;
     let haar_neighbors = if cfg.video.ir_mode { 2 } else { 3 };
     let mut detector = create_detector(
+        Some(&cfg.detection.yunet_path).filter(|p| !p.is_empty()).map(|x| x.as_str()),
         &cfg.detection.model_path,
         cfg.detection.confidence_threshold as f32,
         cfg.detection.nms_threshold as f32,

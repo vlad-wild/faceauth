@@ -99,6 +99,7 @@ fn main() -> Result<()> {
 
     let haar_neighbors = if config.video.ir_mode { 2 } else { 3 };
     let mut detector = create_detector(
+        Some(&config.detection.yunet_path).filter(|p| !p.is_empty()).map(|x| x.as_str()),
         &config.detection.model_path,
         config.detection.confidence_threshold as f32,
         config.detection.nms_threshold as f32,

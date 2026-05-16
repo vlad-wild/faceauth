@@ -26,6 +26,8 @@ pub struct VideoConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionConfig {
     pub model_path: String,
+    #[serde(default = "default_yunet_path")]
+    pub yunet_path: String,
     pub use_cnn: bool,
     pub confidence_threshold: f64,
     #[serde(default = "default_nms_threshold")]
@@ -38,6 +40,7 @@ pub struct DetectionConfig {
     pub max_face_size_ratio: f64,
 }
 
+fn default_yunet_path() -> String { String::new() }
 fn default_nms_threshold() -> f64 { 0.5 }
 fn default_face_padding() -> f64 { 0.15 }
 fn default_min_face_size_ratio() -> f64 { 0.05 }
@@ -72,6 +75,7 @@ impl Default for Config {
             },
             detection: DetectionConfig {
                 model_path: "models/ultra_light_640.onnx".to_string(),
+                yunet_path: "models/face_detection_yunet_2023mar.onnx".to_string(),
                 use_cnn: false,
                 confidence_threshold: 0.7,
                 nms_threshold: 0.5,

@@ -246,6 +246,7 @@ fn test_worker(job: &TestJob) -> iced::futures::stream::BoxStream<'static, Messa
 
                 let haar_neighbors = if cfg.video.ir_mode { 2 } else { 3 };
                 let mut detector = create_detector(
+                    Some(&cfg.detection.yunet_path).filter(|p| !p.is_empty()).map(|x| x.as_str()),
                     &cfg.detection.model_path,
                     cfg.detection.confidence_threshold as f32,
                     cfg.detection.nms_threshold as f32,

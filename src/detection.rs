@@ -1,15 +1,50 @@
 use anyhow::{Context, Result};
 use log::warn;
 use ndarray::Array4;
-use opencv::core::{AlgorithmHint, Mat, Rect, Size, Vector};
-use opencv::prelude::{CascadeClassifierTrait, CascadeClassifierTraitConst, MatTraitConst, MatTraitConstManual};
+use opencv::core::{AlgorithmHint, Mat, Point2f, Rect, Size, Vector};
+use opencv::prelude::{CascadeClassifierTrait, CascadeClassifierTraitConst, MatTraitConst, MatTraitConstManual, FaceDetectorYNTrait};
 use std::path::Path;
 use tract_onnx::prelude::*;
 
+/// Detected face with optional landmarks
 #[derive(Debug, Clone)]
 pub struct Face {
     pub bbox: Rect,
     pub confidence: f32,
+    /// 5 landmarks from YuNet: [right_eye, left_eye, nose, right_mouth, left_mouth]
+    pub landmarks: Vec<Point2f>,
+}
+
+impl Face {
+    fn new(bbox: Rect, confidence: f32) -> Self {
+        Self { bbox, confidence, landmarks: Vec::new() }
+    }
+
+    fn with_landmarks(bbox: Rect, confidence: f32, landmarks: Vec<Point2f>) -> Self {
+        Self { bbox, confidence, landmarks }
+    }
+}
+
+/// Approximate head yaw angle based on eye-nose asymmetry.
+/// Positive = facing left (user's left), negative = facing right.
+/// Returns None if landmarks are not available.
+pub fn estimate_yaw(face: &Face) -> Option<f32> {
+    if face.landmarks.len() < 3 {
+        return None;
+    }
+    let re = &face.landmarks[0]; // right eye (from viewer perspective)
+    let le = &face.landmarks[1]; // left eye
+    let nose = &face.landmarks[2];
+
+    let d_re_nose = (re.x - nose.x).hypot(re.y - nose.y);
+    let d_le_nose = (le.x - nose.x).hypot(le.y - nose.y);
+
+    // Inter-eye distance as normalization factor
+    let d_eyes = (re.x - le.x).hypot(re.y - le.y).max(1.0);
+
+    // Asymmetry ratio; 0 = perfectly frontal
+    let asym = (d_le_nose - d_re_nose) / d_eyes;
+    Some(asym.atan().to_degrees())
 }
 
 type OnnxModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
@@ -86,7 +121,6 @@ impl UltraLightDetector {
                     if score < self.prob_threshold {
                         continue;
                     }
-                    // Normalized coords [x1, y1, x2, y2] relative to model input
                     let x1_f = boxes_view[[0, i, 0]] * self.width as f32;
                     let y1_f = boxes_view[[0, i, 1]] * self.height as f32;
                     let x2_f = boxes_view[[0, i, 2]] * self.width as f32;
@@ -97,15 +131,14 @@ impl UltraLightDetector {
                     let width = (x2_f - x1_f).max(1.0) as i32;
                     let height = (y2_f - y1_f).max(1.0) as i32;
 
-                    faces.push(Face {
-                        bbox: Rect::new(x1, y1, width, height),
-                        confidence: score,
-                    });
+                    faces.push(Face::new(
+                        Rect::new(x1, y1, width, height),
+                        score,
+                    ));
                 }
             }
         }
 
-        // Scale back to original image size
         let scale_x = orig_w / self.width as f32;
         let scale_y = orig_h / self.height as f32;
         for face in &mut faces {
@@ -162,6 +195,95 @@ impl UltraLightDetector {
     }
 }
 
+/// YuNet face detector with built-in landmarks.
+pub struct YuNetDetector {
+    model: opencv::core::Ptr<opencv::objdetect::FaceDetectorYN>,
+    input_size: Size,
+    prob_threshold: f32,
+    nms_threshold: f32,
+}
+
+impl YuNetDetector {
+    pub fn load(
+        model_path: &str,
+        input_size: Size,
+        prob_threshold: f32,
+        nms_threshold: f32,
+    ) -> Result<Self> {
+        let detector = opencv::objdetect::FaceDetectorYN::create(
+            model_path,
+            "",
+            input_size,
+            prob_threshold,
+            nms_threshold,
+            5000,
+            0,
+            0,
+        )?;
+        Ok(Self {
+            model: detector,
+            input_size,
+            prob_threshold,
+            nms_threshold,
+        })
+    }
+
+    pub fn detect(&mut self, image: &Mat) -> Result<Vec<Face>> {
+        // Resize to input_size if needed
+        let mut resized = Mat::default();
+        let (mat_to_process, scale_x, scale_y) = if image.cols() != self.input_size.width
+            || image.rows() != self.input_size.height
+        {
+            opencv::imgproc::resize(
+                image,
+                &mut resized,
+                self.input_size,
+                0.0,
+                0.0,
+                opencv::imgproc::INTER_AREA,
+            )?;
+            (
+                &resized,
+                image.cols() as f32 / self.input_size.width as f32,
+                image.rows() as f32 / self.input_size.height as f32,
+            )
+        } else {
+            (image, 1.0, 1.0)
+        };
+
+        let mut faces_mat = Mat::default();
+        self.model.detect(mat_to_process, &mut faces_mat)?;
+
+        let mut faces = Vec::new();
+        if !faces_mat.empty() {
+            for i in 0..faces_mat.rows() {
+                let data = faces_mat.at_row::<f32>(i)?;
+                let x = (data[0] * scale_x) as i32;
+                let y = (data[1] * scale_y) as i32;
+                let w = (data[2] * scale_x) as i32;
+                let h = (data[3] * scale_y) as i32;
+                let conf = data[14];
+
+                let landmarks = vec![
+                    Point2f::new(data[4] * scale_x, data[5] * scale_y),
+                    Point2f::new(data[6] * scale_x, data[7] * scale_y),
+                    Point2f::new(data[8] * scale_x, data[9] * scale_y),
+                    Point2f::new(data[10] * scale_x, data[11] * scale_y),
+                    Point2f::new(data[12] * scale_x, data[13] * scale_y),
+                ];
+
+                faces.push(Face::with_landmarks(
+                    Rect::new(x, y, w, h),
+                    conf,
+                    landmarks,
+                ));
+            }
+        }
+
+        Ok(nms(faces, self.nms_threshold))
+    }
+}
+
 /// Fallback face detector using OpenCV Haar cascades
 pub struct HaarCascadeDetector {
     classifier: opencv::objdetect::CascadeClassifier,
@@ -173,7 +295,6 @@ impl HaarCascadeDetector {
         Self::with_min_neighbors(cascade_path, 3)
     }
 
-    /// `min_neighbors`: OpenCV Haar `minNeighbors` (lower = more detections, more false positives; try 2 for IR).
     pub fn with_min_neighbors(cascade_path: &str, min_neighbors: i32) -> Result<Self> {
         let classifier = opencv::objdetect::CascadeClassifier::new(cascade_path)?;
         if classifier.empty()? {
@@ -207,19 +328,17 @@ impl HaarCascadeDetector {
         )?;
         let faces = faces
             .into_iter()
-            .map(|rect| Face {
-                bbox: rect,
-                confidence: 1.0, // Haar doesn't provide confidence
-            })
+            .map(|rect| Face::new(rect, 1.0))
             .collect();
         Ok(faces)
     }
 }
 
-/// Unified detector enum (CNN or Haar) with automatic fallback.
+/// Unified detector enum
 pub enum Detector {
     Haar(HaarCascadeDetector),
     Cnn(UltraLightDetector),
+    YuNet(YuNetDetector),
 }
 
 impl Detector {
@@ -227,12 +346,14 @@ impl Detector {
         match self {
             Detector::Haar(d) => d.detect(image),
             Detector::Cnn(d) => d.detect(image),
+            Detector::YuNet(d) => d.detect(image),
         }
     }
 }
 
-/// Try to load CNN detector, fall back to Haar cascade on failure.
+/// Try to load YuNet, fall back to Ultra-Light, then Haar.
 pub fn create_detector(
+    yunet_path: Option<&str>,
     cnn_model_path: &str,
     confidence_threshold: f32,
     nms_threshold: f32,
@@ -240,6 +361,25 @@ pub fn create_detector(
     haar_path: &str,
     haar_neighbors: i32,
 ) -> Result<Detector> {
+    if let Some(path) = yunet_path {
+        if Path::new(path).exists() {
+            match YuNetDetector::load(
+                path,
+                Size::new(640, 640),
+                confidence_threshold,
+                nms_threshold,
+            ) {
+                Ok(d) => {
+                    log::info!("Using YuNet face detector with landmarks");
+                    return Ok(Detector::YuNet(d));
+                }
+                Err(e) => {
+                    warn!("YuNet failed to load ({}). Trying Ultra-Light.", e);
+                }
+            }
+        }
+    }
+
     if use_cnn {
         match UltraLightDetector::load(cnn_model_path, confidence_threshold, nms_threshold) {
             Ok(d) => {

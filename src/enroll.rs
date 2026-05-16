@@ -114,6 +114,7 @@ pub fn enroll_user_with_progress(
     }
     let haar_neighbors = if cfg.video.ir_mode { 2 } else { 3 };
     let mut detector = create_detector(
+        Some(cfg.detection.yunet_path.as_str()).filter(|p| !p.is_empty()),
         &cfg.detection.model_path,
         cfg.detection.confidence_threshold as f32,
         cfg.detection.nms_threshold as f32,
