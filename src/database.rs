@@ -180,3 +180,21 @@ pub fn get_user_model_path(username: &str) -> Result<PathBuf> {
     let dir = get_models_dir()?;
     Ok(dir.join(format!("{}.json", username)))
 }
+
+/// Resolve the user model path using the user's real home directory.
+/// This is necessary when the process runs as root (e.g. via PAM).
+pub fn get_user_model_path_for_user(username: &str) -> Result<PathBuf> {
+    use std::ffi::CStr;
+    use libc::getpwnam;
+
+    let cname = std::ffi::CString::new(username)
+        .with_context(|| "Invalid username")?;
+    unsafe {
+        let pw = getpwnam(cname.as_ptr());
+        if pw.is_null() {
+            anyhow::bail!("User {} not found in passwd database", username);
+        }
+        let home = CStr::from_ptr((*pw).pw_dir).to_string_lossy().to_string();
+        Ok(PathBuf::from(home).join(".local/share/faceauth/models").join(format!("{}.json", username)))
+    }
+}

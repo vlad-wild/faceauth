@@ -1,6 +1,6 @@
 /target
 /pkg
-/src
+/src/faceauth
 /faceauth
 *.pkg.tar.zst
 *.pkg.tar.xz

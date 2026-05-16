@@ -8,7 +8,7 @@ use opencv::prelude::MatTraitConst;
 
 use faceauth::camera;
 use faceauth::config::Config;
-use faceauth::database::{Database, get_user_model_path};
+use faceauth::database::{Database, get_user_model_path_for_user};
 use faceauth::detection::{create_detector, crop_face};
 use faceauth::logger;
 use faceauth::recognition::FaceRecognizer;
@@ -75,7 +75,7 @@ fn main() -> Result<()> {
     let config = Config::load(&args.config).context("Failed to load config")?;
 
     // Load database
-    let model_path = get_user_model_path(&user)?;
+    let model_path = get_user_model_path_for_user(&user)?;
     let db = Database::load(&model_path)?;
     if db.get_user(&user).is_none() {
         log::error!("No face model found for user {}", user);
