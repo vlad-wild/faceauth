@@ -46,6 +46,7 @@ package() {
   # Models
   install -Dm644 "models/MobileFaceNet.onnx" "$pkgdir/etc/faceauth/models/MobileFaceNet.onnx"
   install -Dm644 "models/ultra_light_640.onnx" "$pkgdir/etc/faceauth/models/ultra_light_640.onnx"
+  install -Dm644 "models/face_detection_yunet_2023mar.onnx" "$pkgdir/etc/faceauth/models/face_detection_yunet_2023mar.onnx"
 
   # Config
   install -Dm644 "faceauth.toml" "$pkgdir/etc/faceauth/config.toml"
