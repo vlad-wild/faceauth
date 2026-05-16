@@ -12,7 +12,8 @@
 | Module | Purpose |
 |--------|---------|
 | `camera.rs` | V4L2 capture, rotation, optional downscaling |
-| `detection.rs` | Face detection: **Ultra-Light ONNX** (`use_cnn=true`) or **OpenCV Haar cascade** fallback |
+| `openvino_backend.rs` | OpenVINO ONNX inference wrapper (auto NPU → GPU → CPU) |
+| `detection.rs` | Face detection: **Ultra-Light ONNX/OpenVINO** (`use_cnn=true`) or **OpenCV Haar cascade** fallback |
 | `recognition.rs` | Face embedding via MobileFaceNet ONNX (input 1×3×112×112) |
 | `enroll.rs` | `enroll_user_with_progress`, `capture_single_embedding`, size filtering & crop padding |
 | `database.rs` | JSON storage of `FaceModel` per user in `~/.local/share/faceauth/models/<user>.json` |
@@ -39,8 +40,9 @@ cargo test
 
 ### 1. Face detector selection
 `detection.rs` exposes a unified `Detector` enum (`Haar` / `Cnn`).
-- `create_detector(...)` tries CNN first and **falls back to Haar** if loading fails.
+- `create_detector(...)` tries YuNet first, then Ultra-Light (with OpenVINO if `use_openvino=true`), then falls back to Haar.
 - If `use_cnn=false` in config, Haar is used directly.
+- OpenVINO backend auto-selects device priority: **NPU → GPU → CPU**.
 - Haar path is hard-coded: `/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml`.
 
 ### 2. Face crop padding
@@ -53,7 +55,7 @@ Faces are filtered by min/max area ratios relative to the whole frame:
 This prevents tiny / huge false positives from being passed to the recognizer.
 
 ### 4. Model input shapes
-- **Ultra-Light detector**: automatically inspects ONNX input fact at load time (usually `[1, 3, 480, 640]`). Coordinates are normalized to `[0,1]` inside the net and scaled back to original image dimensions after inference.
+- **Ultra-Light detector**: automatically inspects ONNX (or OpenVINO) input shape at load time (usually `[1, 3, 480, 640]`). Coordinates are normalized to `[0,1]` inside the net and scaled back to original image dimensions after inference.
 - **MobileFaceNet recognizer**: hard-coded `[1, 3, 112, 112]` in `recognition.rs`. Pre-processing normalizes pixels to `[-1, 1]` via `(pixel − 127.5) / 128.0`.
 
 ### 5. Config file locations (in order of precedence)
@@ -62,6 +64,8 @@ This prevents tiny / huge false positives from being passed to the recognizer.
 3. `/etc/faceauth/config.toml`
 
 When editing config, **add `#[serde(default = ...)]`** on new fields so old user configs do not break deserialization.
+- `detection.use_openvino` (bool, default **true**) — enables OpenVINO backend for the Ultra-Light detector when available.
+- `recognition.use_openvino` (bool, default **true**) — enables OpenVINO backend for MobileFaceNet when available.
 
 ### 6. Database format
 Each user has a single JSON file (`<user>.json`) containing a `HashMap<String, FaceModel>`. A `FaceModel` stores:
@@ -80,15 +84,19 @@ Authentication succeeds if the probe embedding matches **any** stored set (prima
 3. Increase `max_height` (e.g. `720.0`) so the camera frame is not downscaled as much.
 4. Adjust `distance_threshold` (lower = stricter, higher = more lenient).
 5. Add appearance variants: `faceauth add -u <user> --variant glasses -s 5`
+6. If you have an Intel NPU, ensure `use_openvino = true` in both `[detection]` and `[recognition]` sections.
 
 ## Files agents often touch
-- `src/detection.rs` – detector logic / NMS / crop
-- `src/recognition.rs` – ONNX embedding extractor
+- `src/detection.rs` – detector logic / NMS / crop / OpenVINO wiring
+- `src/recognition.rs` – ONNX/OpenVINO embedding extractor
 - `src/enroll.rs` – enrollment pipeline
 - `src/config.rs` – config schema & defaults
+- `src/openvino_backend.rs` – OpenVINO session wrapper
 - `faceauth.toml` – local config for quick experiments
 
 ## Common pitfalls
 - Forgetting to import `MatTraitConst` / `CascadeClassifierTrait` when calling OpenCV methods on `Mat` or `CascadeClassifier`.
 - Changing the CNN detector output parsing without checking the actual ONNX output shapes (Ultra-Light may output `boxes`/`scores` in different order depending on the ONNX export).
 - Not adding `#[serde(default)]` on new config fields → breaks existing user configs.
+- Forgetting that OpenVINO feature is gated behind `default = ["openvino"]` — builds with `--no-default-features` will omit the OpenVINO backend entirely.
+- Mismatched `use_openvino` settings between enrollment and authentication do not matter (the model files are the same), but performance and accuracy may differ slightly between CPU and NPU/GPU backends.

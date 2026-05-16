@@ -7,12 +7,13 @@ FaceAuth is a Linux facial authentication system written in Rust, inspired by th
 ## Features
 
 - **Video capture** via OpenCV with manual exposure and rotation control.
-- **Face detection** using Haar cascades (OpenCV) or ONNX models (e.g., UltraLightFaceDetector).
-- **Embedding extraction** with neural network models (MobileFaceNet, ArcFace, etc.).
+- **Face detection** using Haar cascades (OpenCV), ONNX models (e.g., UltraLightFaceDetector), or OpenVINO-accelerated inference on Intel NPU / GPU / CPU.
+- **Embedding extraction** with neural network models (MobileFaceNet, ArcFace, etc.) via ONNX Runtime or OpenVINO.
+- **Automatic hardware acceleration** — OpenVINO backend automatically selects the best available device (NPU → GPU → CPU).
 - **Comparison with reference models** using threshold checks.
 - **PAM integration** via the `faceauth-auth` daemon (uses `pam_exec`).
 - **CLI for management** of user models, configuration, and testing.
-- **Quickshell support** — status widget and notifications.
+- **Comparison with reference models** using threshold checks.
 - **IR camera support** — works with infrared cameras (e.g., Windows Hello) via exposure settings and device selection.
 
 ## IR Camera Support and Login in the Dark
@@ -54,14 +55,15 @@ The **MobileFaceNet** model was trained mostly on RGB; IR quality may be slightl
 │ (Rust binary)   │
 └────────┬────────┘
          │ uses
-┌────────▼─────────────────────────┐
-│ FaceAuth Libraries              │
-│  • camera — frame capture       │
-│  • detection — face detection   │
-│  • recognition — embeddings     │
-│  • database — model storage     │
-│  • config — TOML configuration  │
-└──────────────────────────────────┘
+┌────────▼─────────────────────────────────────────────┐
+│ FaceAuth Libraries                                  │
+│  • camera — frame capture                          │
+│  • detection — face detection (Haar / ONNX / OpenVINO) │
+│  • recognition — embeddings (ONNX / OpenVINO)      │
+│  • openvino_backend — OpenVINO inference wrapper   │
+│  • database — model storage                         │
+│  • config — TOML configuration                    │
+└──────────────────────────────────────────────────────┘
 ```
 
 ## Installation (for Arch Linux)
@@ -74,6 +76,7 @@ FaceAuth can be installed by building from source or via PKGBUILD (AUR).
 - **v4l-utils** – video camera utilities
 - **pam** – PAM library (usually pre-installed)
 - **rust** and **cargo** – for building from source
+- **openvino-runtime** *(optional)* – for Intel NPU/GPU/CPU acceleration (see OpenVINO section below)
 
 ### Method 1: Build from Source
 
@@ -93,9 +96,15 @@ FaceAuth can be installed by building from source or via PKGBUILD (AUR).
    ```bash
    sudo cp target/release/faceauth /usr/local/bin/
    sudo cp target/release/faceauth-auth /usr/local/bin/
+   sudo cp target/release/faceauth-ui /usr/local/bin/
    sudo mkdir -p /etc/faceauth
    sudo cp faceauth.toml /etc/faceauth/config.toml
    ```
+
+> **Build without OpenVINO:** If you don't need Intel NPU/GPU/CPU acceleration via OpenVINO, build with:
+> ```bash
+> cargo build --release --no-default-features
+> ```
 
 ### Method 2: Install via PKGBUILD (AUR)
 
@@ -158,7 +167,52 @@ Stores a **primary** embedding set and named **variants** (e.g., `glasses`). Use
 
 `faceauth-ui` uses radio buttons for the same modes.
 
-### Graphical Interface (`faceauth-ui`)
+### OpenVINO / Intel NPU Acceleration
+
+FaceAuth supports **OpenVINO** inference backend for both face detection (Ultra-Light) and face recognition (MobileFaceNet). When enabled, the framework automatically selects the best available device in priority order:
+
+1. **NPU** (Intel Neural Processing Unit / AI Boost)
+2. **GPU** (Intel integrated graphics)
+3. **CPU** (fallback)
+
+### Enabling OpenVINO
+
+Both `[detection]` and `[recognition]` have `use_openvino = true` by default. To disable OpenVINO and force CPU inference via `tract-onnx`, set:
+
+```toml
+[detection]
+use_openvino = false
+
+[recognition]
+use_openvino = false
+```
+
+### Installing OpenVINO Runtime
+
+On Arch Linux, OpenVINO is available via the **AUR** (not in official repositories). Choose one of the following methods:
+
+**Build from source (AUR):**
+```bash
+yay -S openvino
+```
+
+**Pre-compiled binary (AUR, may be outdated):**
+```bash
+yay -S openvino-bin
+```
+
+**Alternative (Python/PyPI):**
+If you only need the runtime libraries and have Python available, you can also install the shared libraries via pip in a virtual environment (the Rust crate uses `runtime-linking` and needs the `.so` files at runtime):
+```bash
+python -m venv /opt/openvino-runtime
+source /opt/openvino-runtime/bin/activate
+pip install openvino
+```
+Then ensure `/opt/openvino-runtime/lib/python3.x/site-packages/openvino/libs` (or wherever the `.so` files end up) is in your `LD_LIBRARY_PATH`, or symlink them to `/usr/local/lib`.
+
+> **Note:** `use_openvino` settings during enrollment and authentication do not need to match (the model files are identical). However, accuracy may differ slightly between NPU/GPU and CPU backends. If you encounter false rejections after switching devices, consider re-enrolling with the new backend.
+
+## Graphical Interface (`faceauth-ui`)
 
 Camera preview window for face capture without CLI: preview, capture progress, same settings as `faceauth add`.
 
@@ -186,11 +240,14 @@ ir_mode = false
 
 [detection]
 model_path = "models/ultra_light_640.onnx"
+yunet_path = "models/face_detection_yunet_2023mar.onnx"
 use_cnn = false
+use_openvino = true   # enable OpenVINO for detector (NPU → GPU → CPU)
 confidence_threshold = 0.7
 
 [recognition]
 model_path = "models/mobilefacenet.onnx"
+use_openvino = true   # enable OpenVINO for recognizer
 embedding_size = 128
 distance_threshold = 0.6
 
@@ -199,42 +256,6 @@ end_report = false
 save_failed = false
 save_successful = false
 ```
-
-## Quickshell Integration
-
-FaceAuth can provide auth status via D-Bus or Unix socket for Quickshell display.
-
-### Status Widget
-
-Example QML widget for Quickshell:
-```qml
-import QtQuick 2.15
-import QtQuick.Controls 2.15
-
-Item {
-    property bool faceAuthReady: false
-
-    Timer {
-        interval: 5000
-        running: true
-        repeat: true
-        onTriggered: {
-            // Check FaceAuth daemon status
-            faceAuthReady = checkFaceAuthStatus()
-        }
-    }
-
-    Image {
-        source: faceAuthReady ? "face-ok.svg" : "face-off.svg"
-        width: 24
-        height: 24
-    }
-}
-```
-
-### Notifications
-
-On failed auth, FaceAuth can send notifications via `libnotify`.
 
 ## Security
 
@@ -248,16 +269,17 @@ On failed auth, FaceAuth can send notifications via `libnotify`.
 
 ```
 src/
-├── camera.rs      # Video capture, frame processing
-├── config.rs      # Config load/save
-├── detection.rs   # Face detection (Haar / ONNX)
-├── enroll.rs      # Model enrollment (CLI + UI)
-├── recognition.rs # Embedding extraction
-├── database.rs    # Model storage and comparison
-├── main.rs        # CLI utility
+├── camera.rs            # Video capture, frame processing
+├── config.rs            # Config load/save
+├── detection.rs         # Face detection (Haar / ONNX / OpenVINO)
+├── enroll.rs            # Model enrollment (CLI + UI)
+├── recognition.rs       # Embedding extraction (ONNX / OpenVINO)
+├── openvino_backend.rs  # OpenVINO inference wrapper (auto NPU → GPU → CPU)
+├── database.rs          # Model storage and comparison
+├── main.rs              # CLI utility
 └── bin/
-    ├── auth.rs    # PAM daemon
-    └── faceauth-ui.rs  # Face capture window
+    ├── auth.rs          # PAM daemon
+    └── ui.rs            # Face capture window
 ```
 
 ### Adding New Recognition Model
@@ -265,6 +287,7 @@ src/
 1. Place ONNX model files in `models/`.
 2. Update `config.toml` with model paths.
 3. Implement preprocessing in `recognition.rs`.
+4. OpenVINO will be used automatically if `use_openvino = true` and the model is compatible; otherwise, `tract-onnx` is used as a fallback.
 
 ## License
 
