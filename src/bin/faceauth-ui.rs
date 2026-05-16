@@ -1,4 +1,5 @@
 use std::hash::{Hash, Hasher};
+use std::time::{Duration, Instant};
 
 use iced::{
     futures::StreamExt,
@@ -11,8 +12,11 @@ use opencv::prelude::{MatTraitConst, MatTraitConstManual};
 
 use faceauth::camera::Camera;
 use faceauth::config::Config;
+use faceauth::database::{Database, get_user_model_path};
+use faceauth::detection::create_detector;
 use faceauth::enroll::{self, EnrollMerge, EnrollParams};
 use faceauth::logger;
+use faceauth::recognition::FaceRecognizer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiEnrollMode {
@@ -37,6 +41,8 @@ enum Message {
     EnrollPressed,
     EnrollSample(usize, usize),
     EnrollDone(Result<(), String>),
+    TestPressed,
+    TestResult(Result<bool, String>),
 }
 
 #[derive(Clone)]
@@ -77,6 +83,27 @@ impl PartialEq for EnrollJob {
 
 impl Eq for EnrollJob {}
 
+#[derive(Clone)]
+struct TestJob {
+    id: u64,
+    cfg: Config,
+    username: String,
+}
+
+impl Hash for TestJob {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl PartialEq for TestJob {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for TestJob {}
+
 struct FaceauthUi {
     base_config: Config,
     config_source: Option<std::path::PathBuf>,
@@ -92,6 +119,8 @@ struct FaceauthUi {
     enroll_job: Option<EnrollJob>,
     enroll_cur: usize,
     enroll_tot: usize,
+    testing: bool,
+    test_job: Option<TestJob>,
     status: String,
     enroll_mode: UiEnrollMode,
     variant_name: String,
@@ -120,6 +149,8 @@ impl FaceauthUi {
                 enroll_job: None,
                 enroll_cur: 0,
                 enroll_tot: 0,
+                testing: false,
+                test_job: None,
                 status: String::new(),
                 enroll_mode: UiEnrollMode::ReplaceAll,
                 variant_name: String::new(),
@@ -190,6 +221,73 @@ fn enroll_worker(job: &EnrollJob) -> iced::futures::stream::BoxStream<'static, M
                 let _ = output2.try_send(Message::EnrollSample(c, t));
             });
             let _ = output.try_send(Message::EnrollDone(r.map_err(|e| e.to_string())));
+        });
+    })
+    .boxed()
+}
+
+fn test_worker(job: &TestJob) -> iced::futures::stream::BoxStream<'static, Message> {
+    let job = job.clone();
+    iced::stream::channel(16, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+        std::thread::spawn(move || {
+            let TestJob { cfg, username, .. } = job;
+            let result = (|| -> anyhow::Result<bool> {
+                let model_path = get_user_model_path(&username)?;
+                let db = Database::load(&model_path)?;
+                if db.get_user(&username).is_none() {
+                    anyhow::bail!("No model enrolled for user {}", username);
+                }
+
+                let mut cam = Camera::open(&cfg.video.device_path, cfg.video.max_height, cfg.video.rotate)
+                    .map_err(|e| anyhow::anyhow!("Failed to open camera: {e}"))?;
+                if cfg.video.exposure >= 0 {
+                    let _ = cam.set_exposure(cfg.video.exposure as f64);
+                }
+
+                let haar_neighbors = if cfg.video.ir_mode { 2 } else { 3 };
+                let mut detector = create_detector(
+                    &cfg.detection.model_path,
+                    cfg.detection.confidence_threshold as f32,
+                    cfg.detection.nms_threshold as f32,
+                    cfg.detection.use_cnn,
+                    enroll::DEFAULT_HAAR_CASCADE,
+                    haar_neighbors,
+                ).map_err(|e| anyhow::anyhow!("Detector init failed: {e}"))?;
+
+                let mut recognizer = FaceRecognizer::load(&cfg.recognition.model_path)
+                    .map_err(|e| anyhow::anyhow!("Recognizer load failed: {e}"))?;
+
+                let timeout = Duration::from_secs(cfg.video.timeout as u64).max(Duration::from_secs(3));
+                let started = Instant::now();
+                let probe = loop {
+                    if started.elapsed() >= timeout {
+                        anyhow::bail!("Timeout: no face detected during test");
+                    }
+                    match enroll::capture_single_embedding(&mut cam, &mut detector, &mut recognizer, &cfg) {
+                        Ok(Some(emb)) => break emb,
+                        Ok(None) => {
+                            std::thread::sleep(Duration::from_millis(60));
+                            continue;
+                        }
+                        Err(e) => anyhow::bail!("Capture error: {e}"),
+                    }
+                };
+
+                let threshold = cfg.recognition.distance_threshold as f32;
+                let distance = db
+                    .get_user(&username)
+                    .map(|m| m.best_match_distance(&probe))
+                    .ok_or_else(|| anyhow::anyhow!("User model disappeared"))?;
+
+                Ok(distance < threshold)
+            })();
+
+            let msg = match result {
+                Ok(true) => Message::TestResult(Ok(true)),
+                Ok(false) => Message::TestResult(Ok(false)),
+                Err(e) => Message::TestResult(Err(e.to_string())),
+            };
+            let _ = output.try_send(msg);
         });
     })
     .boxed()
@@ -298,6 +396,33 @@ fn update(state: &mut FaceauthUi, message: Message) -> Task<Message> {
                 Err(e) => state.status = format!("Error: {e}"),
             }
         }
+        Message::TestPressed => {
+            if !state.testing && !state.enrolling && !state.username.trim().is_empty() {
+                state.preview_on = false;
+                state.preview_params = None;
+                state.preview_handle = None;
+                let mut cfg = state.base_config.clone();
+                if state.ir {
+                    cfg.video.ir_mode = true;
+                }
+                state.testing = true;
+                state.status = "Testing authentication...".to_string();
+                state.test_job = Some(TestJob {
+                    id: rand::random::<u64>(),
+                    cfg,
+                    username: state.username.trim().to_string(),
+                });
+            }
+        }
+        Message::TestResult(r) => {
+            state.testing = false;
+            state.test_job = None;
+            state.status = match r {
+                Ok(true) => "Test PASSED".to_string(),
+                Ok(false) => "Test FAILED (distance too high)".to_string(),
+                Err(e) => format!("Test error: {e}"),
+            };
+        }
     }
     Task::none()
 }
@@ -309,6 +434,9 @@ fn subscription(state: &FaceauthUi) -> Subscription<Message> {
     }
     if let Some(job) = &state.enroll_job {
         subs.push(Subscription::run_with(job.clone(), enroll_worker));
+    }
+    if let Some(job) = &state.test_job {
+        subs.push(Subscription::run_with(job.clone(), test_worker));
     }
     Subscription::batch(subs)
 }
@@ -376,6 +504,8 @@ fn view(state: &FaceauthUi) -> Element<'_, Message> {
         text("").into()
     };
 
+    let busy = state.enrolling || state.testing;
+
     let content = column![
         text("Faceauth — face recording").size(24),
         text(config_text).size(14),
@@ -416,8 +546,9 @@ fn view(state: &FaceauthUi) -> Element<'_, Message> {
         mode_buttons,
         variant_input,
         row![
-            button("Preview").on_press_maybe(if !state.enrolling { Some(Message::TogglePreview) } else { None }),
-            button("Record a face").on_press_maybe(if !state.enrolling && !state.username.trim().is_empty() { Some(Message::EnrollPressed) } else { None }),
+            button("Preview").on_press_maybe(if !busy { Some(Message::TogglePreview) } else { None }),
+            button("Record a face").on_press_maybe(if !busy && !state.username.trim().is_empty() { Some(Message::EnrollPressed) } else { None }),
+            button("Test auth").on_press_maybe(if !busy && !state.username.trim().is_empty() { Some(Message::TestPressed) } else { None }),
         ]
         .spacing(10),
         preview,
