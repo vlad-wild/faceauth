@@ -49,9 +49,15 @@ pub fn estimate_yaw(face: &Face) -> Option<f32> {
 
 type OnnxModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
 
+enum UltraLightBackend {
+    #[cfg(feature = "openvino")]
+    OpenVino(crate::openvino_backend::OpenVinoSession),
+    Tract(OnnxModel),
+}
+
 /// Ultra-Light face detector using ONNX
 pub struct UltraLightDetector {
-    model: OnnxModel,
+    backend: UltraLightBackend,
     width: usize,
     height: usize,
     prob_threshold: f32,
@@ -59,10 +65,39 @@ pub struct UltraLightDetector {
 }
 
 impl UltraLightDetector {
-    pub fn load(model_path: &str, prob_threshold: f32, nms_threshold: f32) -> Result<Self> {
+    pub fn load(model_path: &str, prob_threshold: f32, nms_threshold: f32, use_openvino: bool) -> Result<Self> {
+        let _ = use_openvino;
         let path = Path::new(model_path);
         if !path.exists() {
             anyhow::bail!("Model not found: {}", model_path);
+        }
+
+        #[cfg(feature = "openvino")]
+        if use_openvino {
+            match crate::openvino_backend::OpenVinoSession::from_onnx(model_path) {
+                Ok(session) => {
+                    log::info!("Ultra-Light detector loaded via OpenVINO on {}", session.device());
+                    let shape = &session.input_shape;
+                    let height = shape
+                        .get(2)
+                        .copied()
+                        .context("Cannot get input height from OpenVINO model")? as usize;
+                    let width = shape
+                        .get(3)
+                        .copied()
+                        .context("Cannot get input width from OpenVINO model")? as usize;
+                    return Ok(Self {
+                        backend: UltraLightBackend::OpenVino(session),
+                        width,
+                        height,
+                        prob_threshold,
+                        nms_threshold,
+                    });
+                }
+                Err(e) => {
+                    warn!("OpenVINO detector init failed: {e}. Falling back to tract-onnx.");
+                }
+            }
         }
 
         let model = tract_onnx::onnx()
@@ -72,6 +107,7 @@ impl UltraLightDetector {
             .context("Failed to optimize ONNX model")?
             .into_runnable()
             .context("Failed to create ONNX runnable model")?;
+        log::info!("Ultra-Light detector loaded via tract-onnx (CPU)");
 
         let input_fact = model.model().input_fact(0)?;
         let shape = input_fact.shape.to_tvec();
@@ -85,7 +121,7 @@ impl UltraLightDetector {
             .context("Cannot get input width")? as usize;
 
         Ok(Self {
-            model,
+            backend: UltraLightBackend::Tract(model),
             width,
             height,
             prob_threshold,
@@ -93,50 +129,72 @@ impl UltraLightDetector {
         })
     }
 
-    pub fn detect(&self, image: &Mat) -> Result<Vec<Face>> {
+    pub fn detect(&mut self, image: &Mat) -> Result<Vec<Face>> {
         let orig_h = image.rows() as f32;
         let orig_w = image.cols() as f32;
 
         let input = self.preprocess(image)?;
-        let outputs = self.model.run(tvec!(input.into_tensor().into()))?;
 
-        log::debug!("Ultra-Light outputs count: {}", outputs.len());
-        for (i, o) in outputs.iter().enumerate() {
-            if let Ok(view) = o.to_array_view::<f32>() {
-                log::debug!("Output {} shape: {:?}", i, view.shape());
+        let (scores_data, boxes_data) = match &mut self.backend {
+            #[cfg(feature = "openvino")]
+            UltraLightBackend::OpenVino(session) => {
+                let outputs = session.run(input).context("OpenVINO inference failed")?;
+                if outputs.len() < 2 {
+                    anyhow::bail!("Ultra-Light OpenVINO model returned fewer than 2 outputs");
+                }
+                let scores = outputs[0].1.clone();
+                let boxes = outputs[1].1.clone();
+                (scores, boxes)
             }
-        }
+            UltraLightBackend::Tract(model) => {
+                let outputs = model.run(tvec!(input.into_tensor().into()))?;
+                if outputs.len() < 2 {
+                    anyhow::bail!("Ultra-Light tract model returned fewer than 2 outputs");
+                }
+                let scores_view = outputs[0].to_array_view::<f32>()?;
+                let boxes_view = outputs[1].to_array_view::<f32>()?;
+                let scores = scores_view.iter().copied().collect::<Vec<f32>>();
+                let boxes = boxes_view.iter().copied().collect::<Vec<f32>>();
+                (scores, boxes)
+            }
+        };
 
         let mut faces = Vec::new();
 
         // Ultra-Light: outputs[0] = scores [1,N,2], outputs[1] = boxes [1,N,4]
-        if outputs.len() >= 2 {
-            let scores_view = outputs[0].to_array_view::<f32>()?;
-            let boxes_view = outputs[1].to_array_view::<f32>()?;
+        // Tract shapes are known from its own model; for OpenVINO we also receive flat arrays.
+        // We can reconstruct based on length ratios: boxes has 4x the elements of scores (per anchor).
+        let num_scores = scores_data.len();
+        let num_boxes = boxes_data.len();
+        // typical: scores [1,N,2] -> 2*N elements, boxes [1,N,4] -> 4*N elements
+        let num_anchors = num_scores / 2;
+        if num_anchors == 0 || num_boxes != num_anchors * 4 {
+            anyhow::bail!(
+                "Ultra-Light output shape mismatch: scores={}, boxes={}",
+                num_scores,
+                num_boxes
+            );
+        }
 
-            if boxes_view.ndim() >= 3 && scores_view.ndim() >= 3 {
-                let num_anchors = boxes_view.shape()[1];
-                for i in 0..num_anchors {
-                    let score = scores_view[[0, i, 1]]; // class 1 = face
-                    if score < self.prob_threshold {
-                        continue;
-                    }
-                    let x1_f = boxes_view[[0, i, 0]] * self.width as f32;
-                    let y1_f = boxes_view[[0, i, 1]] * self.height as f32;
-                    let x2_f = boxes_view[[0, i, 2]] * self.width as f32;
-                    let y2_f = boxes_view[[0, i, 3]] * self.height as f32;
-
-                    let x1 = x1_f.max(0.0) as i32;
-                    let y1 = y1_f.max(0.0) as i32;
-                    let width = (x2_f - x1_f).max(1.0) as i32;
-                    let height = (y2_f - y1_f).max(1.0) as i32;
-
-                    faces.push(Face::new(
-                        Rect::new(x1, y1, width, height),
-                        score,
-                    ));
-                }
+        for i in 0..num_anchors {
+            let score = scores_data[i * 2 + 1]; // class 1 = face
+            if score < self.prob_threshold {
+                continue;
             }
+            let x1_f = boxes_data[i * 4 + 0] * self.width as f32;
+            let y1_f = boxes_data[i * 4 + 1] * self.height as f32;
+            let x2_f = boxes_data[i * 4 + 2] * self.width as f32;
+            let y2_f = boxes_data[i * 4 + 3] * self.height as f32;
+
+            let x1 = x1_f.max(0.0) as i32;
+            let y1 = y1_f.max(0.0) as i32;
+            let width = (x2_f - x1_f).max(1.0) as i32;
+            let height = (y2_f - y1_f).max(1.0) as i32;
+
+            faces.push(Face::new(
+                Rect::new(x1, y1, width, height),
+                score,
+            ));
         }
 
         let scale_x = orig_w / self.width as f32;
@@ -192,6 +250,14 @@ impl UltraLightDetector {
         }
 
         Ok(input)
+    }
+
+    pub fn backend_info(&self) -> String {
+        match &self.backend {
+            #[cfg(feature = "openvino")]
+            UltraLightBackend::OpenVino(session) => format!("OpenVINO ({})", session.device()),
+            UltraLightBackend::Tract(_) => "tract-onnx (CPU)".to_string(),
+        }
     }
 }
 
@@ -352,6 +418,7 @@ impl Detector {
 }
 
 /// Try to load YuNet, fall back to Ultra-Light, then Haar.
+/// `use_openvino` enables the OpenVINO backend for Ultra-Light when available.
 pub fn create_detector(
     yunet_path: Option<&str>,
     cnn_model_path: &str,
@@ -360,6 +427,7 @@ pub fn create_detector(
     use_cnn: bool,
     haar_path: &str,
     haar_neighbors: i32,
+    use_openvino: bool,
 ) -> Result<Detector> {
     if let Some(path) = yunet_path {
         if Path::new(path).exists() {
@@ -381,7 +449,7 @@ pub fn create_detector(
     }
 
     if use_cnn {
-        match UltraLightDetector::load(cnn_model_path, confidence_threshold, nms_threshold) {
+        match UltraLightDetector::load(cnn_model_path, confidence_threshold, nms_threshold, use_openvino) {
             Ok(d) => {
                 log::info!("Using CNN face detector (Ultra-Light)");
                 return Ok(Detector::Cnn(d));
@@ -391,6 +459,7 @@ pub fn create_detector(
             }
         }
     }
+    log::info!("Using Haar cascade face detector (CPU)");
     Ok(Detector::Haar(HaarCascadeDetector::with_min_neighbors(
         haar_path, haar_neighbors,
     )?))

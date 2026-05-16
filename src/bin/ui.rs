@@ -56,6 +56,7 @@ struct PreviewParams {
     confidence_threshold: f32,
     nms_threshold: f32,
     use_cnn: bool,
+    use_openvino: bool,
     haar_neighbors: i32,
 }
 
@@ -70,6 +71,7 @@ impl Hash for PreviewParams {
         self.confidence_threshold.to_bits().hash(state);
         self.nms_threshold.to_bits().hash(state);
         self.use_cnn.hash(state);
+        self.use_openvino.hash(state);
         self.haar_neighbors.hash(state);
     }
 }
@@ -209,6 +211,7 @@ fn preview_worker(params: &PreviewParams) -> iced::futures::stream::BoxStream<'s
                 params.use_cnn,
                 enroll::DEFAULT_HAAR_CASCADE,
                 params.haar_neighbors,
+                params.use_openvino,
             ) {
                 Ok(d) => d,
                 Err(e) => {
@@ -310,9 +313,10 @@ fn test_worker(job: &TestJob) -> iced::futures::stream::BoxStream<'static, Messa
                     cfg.detection.use_cnn,
                     enroll::DEFAULT_HAAR_CASCADE,
                     haar_neighbors,
+                    cfg.detection.use_openvino,
                 ).map_err(|e| anyhow::anyhow!("Detector init failed: {e}"))?;
 
-                let mut recognizer = FaceRecognizer::load(&cfg.recognition.model_path)
+                let mut recognizer = FaceRecognizer::load(&cfg.recognition.model_path, cfg.recognition.use_openvino)
                     .map_err(|e| anyhow::anyhow!("Recognizer load failed: {e}"))?;
 
                 let timeout = Duration::from_secs(cfg.video.timeout as u64).max(Duration::from_secs(3));
@@ -373,6 +377,7 @@ fn update(state: &mut FaceauthUi, message: Message) -> Task<Message> {
                     confidence_threshold: state.base_config.detection.confidence_threshold as f32,
                     nms_threshold: state.base_config.detection.nms_threshold as f32,
                     use_cnn: state.base_config.detection.use_cnn,
+                    use_openvino: state.base_config.detection.use_openvino,
                     haar_neighbors: if state.ir { 2 } else { 3 },
                 });
                 state.status = "Opening camera...".to_string();

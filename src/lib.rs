@@ -5,3 +5,6 @@ pub mod detection;
 pub mod enroll;
 pub mod recognition;
 pub mod logger;
+
+#[cfg(feature = "openvino")]
+pub mod openvino_backend;

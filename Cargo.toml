@@ -28,6 +28,11 @@ tract-onnx = "0.22"
 syslog = "6.1"
 lazy_static = "1.4"
 iced = { version = "0.14", features = ["image", "tokio"] }
+openvino = { version = "0.11", optional = true, features = ["runtime-linking"] }
+
+[features]
+default = ["openvino"]
+openvino = ["dep:openvino"]
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -38,7 +43,7 @@ path = "src/bin/auth.rs"
 
 [[bin]]
 name = "faceauth-ui"
-path = "src/bin/faceauth-ui.rs"
+path = "src/bin/ui.rs"
 
 [profile.release]
 opt-level = 3

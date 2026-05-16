@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::warn;
+use log::{info, warn};
 use ndarray::Array4;
 use opencv::core::{AlgorithmHint, Mat, Size};
 use opencv::prelude::{MatTraitConst, MatTraitConstManual};
@@ -42,6 +42,8 @@ impl FaceEmbedding {
 type OnnxModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
 
 enum Backend {
+    #[cfg(feature = "openvino")]
+    OpenVino(crate::openvino_backend::OpenVinoSession),
     Onnx(OnnxModel),
     Fallback,
 }
@@ -51,17 +53,39 @@ pub struct FaceRecognizer {
 }
 
 impl FaceRecognizer {
-    /// Load ONNX model for face recognition, fallback to deterministic extractor on failure.
-    pub fn load(model_path: &str) -> Result<Self> {
+    /// Load model. If `use_openvino` is true and the feature is compiled in,
+    /// attempt OpenVINO first, then tract-onnx, then deterministic fallback.
+    /// If `use_openvino` is false, skip OpenVINO.
+    pub fn load(model_path: &str, use_openvino: bool) -> Result<Self> {
+        let _ = use_openvino;
         let path = Path::new(model_path);
         if !path.exists() {
             warn!(
                 "Recognition model not found at {}, using deterministic fallback",
                 model_path
             );
+            info!("Recognition loaded via deterministic fallback (CPU)");
             return Ok(Self {
                 backend: Backend::Fallback,
             });
+        }
+
+        #[cfg(feature = "openvino")]
+        if use_openvino {
+            match crate::openvino_backend::OpenVinoSession::from_onnx(model_path) {
+                Ok(session) => {
+                    info!(
+                        "Recognition loaded via OpenVINO on {}",
+                        session.device()
+                    );
+                    return Ok(Self {
+                        backend: Backend::OpenVino(session),
+                    });
+                }
+                Err(e) => {
+                    warn!("OpenVINO backend init failed: {e}. Trying tract-onnx fallback");
+                }
+            }
         }
 
         match tract_onnx::onnx()
@@ -74,11 +98,15 @@ impl FaceRecognizer {
             .into_runnable()
             .context("Failed to create ONNX runnable model")
         {
-            Ok(model) => Ok(Self {
-                backend: Backend::Onnx(model),
-            }),
+            Ok(model) => {
+                info!("Recognition loaded via tract-onnx (CPU)");
+                Ok(Self {
+                    backend: Backend::Onnx(model),
+                })
+            },
             Err(e) => {
-                warn!("ONNX backend init failed: {e}. Using deterministic fallback");
+                warn!("tract-onnx backend init failed: {e}. Using deterministic fallback");
+                info!("Recognition loaded via deterministic fallback (CPU)");
                 Ok(Self {
                     backend: Backend::Fallback,
                 })
@@ -86,8 +114,28 @@ impl FaceRecognizer {
         }
     }
 
-    /// Extract embedding from a face crop, using ONNX when available.
+    pub fn backend_info(&self) -> String {
+        match &self.backend {
+            #[cfg(feature = "openvino")]
+            Backend::OpenVino(session) => format!("OpenVINO ({})", session.device()),
+            Backend::Onnx(_) => "tract-onnx (CPU)".to_string(),
+            Backend::Fallback => "deterministic fallback (CPU)".to_string(),
+        }
+    }
+
+    /// Extract embedding from a face crop, using best available backend.
     pub fn extract(&mut self, face_image: &opencv::core::Mat) -> Result<FaceEmbedding> {
+        #[cfg(feature = "openvino")]
+        if let Backend::OpenVino(session) = &mut self.backend {
+            return match extract_openvino_embedding(session, face_image) {
+                Ok(emb) => Ok(emb),
+                Err(e) => {
+                    warn!("OpenVINO inference failed, falling back: {e}");
+                    extract_fallback_embedding(face_image)
+                }
+            };
+        }
+
         if let Backend::Onnx(model) = &self.backend {
             match extract_onnx_embedding(model, face_image) {
                 Ok(embedding) => return Ok(embedding),
@@ -99,6 +147,23 @@ impl FaceRecognizer {
 
         extract_fallback_embedding(face_image)
     }
+}
+
+#[cfg(feature = "openvino")]
+fn extract_openvino_embedding(
+    session: &mut crate::openvino_backend::OpenVinoSession,
+    face_image: &opencv::core::Mat,
+) -> Result<FaceEmbedding> {
+    let input = preprocess_for_mobilefacenet(face_image)?;
+    let outputs = session.run(input).context("OpenVINO inference failed")?;
+    let (_, data) = outputs
+        .into_iter()
+        .next()
+        .context("OpenVINO model returned no outputs")?;
+    if data.is_empty() {
+        anyhow::bail!("OpenVINO output embedding is empty");
+    }
+    Ok(FaceEmbedding::new(data))
 }
 
 fn extract_onnx_embedding(model: &OnnxModel, face_image: &opencv::core::Mat) -> Result<FaceEmbedding> {

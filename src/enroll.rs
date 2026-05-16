@@ -121,8 +121,9 @@ pub fn enroll_user_with_progress(
         cfg.detection.use_cnn,
         DEFAULT_HAAR_CASCADE,
         haar_neighbors,
+        cfg.detection.use_openvino,
     )?;
-    let mut recognizer = FaceRecognizer::load(&cfg.recognition.model_path)?;
+    let mut recognizer = FaceRecognizer::load(&cfg.recognition.model_path, cfg.recognition.use_openvino)?;
 
     if cfg.video.ir_mode {
         info!("IR mode: darkness filter disabled; enroll on the same IR device as faceauth-auth");

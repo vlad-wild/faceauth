@@ -106,11 +106,12 @@ fn main() -> Result<()> {
         config.detection.use_cnn,
         "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
         haar_neighbors,
+        config.detection.use_openvino,
     )
     .context("Failed to initialize face detector")?;
 
     // Initialize face recognizer
-    let mut recognizer = FaceRecognizer::load(&config.recognition.model_path)
+    let mut recognizer = FaceRecognizer::load(&config.recognition.model_path, config.recognition.use_openvino)
         .context("Failed to load recognition model")?;
 
     // Main authentication loop

@@ -299,8 +299,9 @@ fn test_auth(user: &str, timeout_override: Option<u32>, ir: bool) -> Result<()> 
         cfg.detection.use_cnn,
         enroll::DEFAULT_HAAR_CASCADE,
         haar_neighbors,
+        cfg.detection.use_openvino,
     )?;
-    let mut recognizer = FaceRecognizer::load(&cfg.recognition.model_path)?;
+    let mut recognizer = FaceRecognizer::load(&cfg.recognition.model_path, cfg.recognition.use_openvino)?;
     let timeout_secs = timeout_override.unwrap_or(cfg.video.timeout).max(3);
     let timeout = Duration::from_secs(timeout_secs as u64);
     let started = Instant::now();

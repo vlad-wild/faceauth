@@ -38,6 +38,8 @@ pub struct DetectionConfig {
     pub min_face_size_ratio: f64,
     #[serde(default = "default_max_face_size_ratio")]
     pub max_face_size_ratio: f64,
+    #[serde(default = "default_use_openvino")]
+    pub use_openvino: bool,
 }
 
 fn default_yunet_path() -> String { String::new() }
@@ -45,12 +47,15 @@ fn default_nms_threshold() -> f64 { 0.5 }
 fn default_face_padding() -> f64 { 0.15 }
 fn default_min_face_size_ratio() -> f64 { 0.05 }
 fn default_max_face_size_ratio() -> f64 { 0.75 }
+fn default_use_openvino() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecognitionConfig {
     pub model_path: String,
     pub embedding_size: usize,
     pub distance_threshold: f64,
+    #[serde(default = "default_use_openvino")]
+    pub use_openvino: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,11 +87,13 @@ impl Default for Config {
                 face_padding: 0.15,
                 min_face_size_ratio: 0.05,
                 max_face_size_ratio: 0.75,
+                use_openvino: true,
             },
             recognition: RecognitionConfig {
                 model_path: "models/mobilefacenet.onnx".to_string(),
                 embedding_size: 128,
                 distance_threshold: 0.6,
+                use_openvino: true,
             },
             debug: DebugConfig {
                 end_report: false,
