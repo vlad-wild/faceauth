@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "faceauth"
-version = "0.2.0"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "chrono",
