@@ -6,7 +6,7 @@ use iced::{
     widget::{button, checkbox, column, container, image, progress_bar, radio, row, slider, text, text_input},
     Alignment, ContentFit, Element, Length, Subscription, Task,
 };
-use opencv::core::AlgorithmHint;
+use opencv::core::{AlgorithmHint, Point, Rect, Scalar};
 use opencv::imgproc;
 use opencv::prelude::{MatTraitConst, MatTraitConstManual};
 
@@ -51,6 +51,12 @@ struct PreviewParams {
     max_height: f64,
     rotate: i32,
     exposure: i32,
+    yunet_path: String,
+    model_path: String,
+    confidence_threshold: f32,
+    nms_threshold: f32,
+    use_cnn: bool,
+    haar_neighbors: i32,
 }
 
 impl Hash for PreviewParams {
@@ -59,6 +65,12 @@ impl Hash for PreviewParams {
         self.max_height.to_bits().hash(state);
         self.rotate.hash(state);
         self.exposure.hash(state);
+        self.yunet_path.hash(state);
+        self.model_path.hash(state);
+        self.confidence_threshold.to_bits().hash(state);
+        self.nms_threshold.to_bits().hash(state);
+        self.use_cnn.hash(state);
+        self.haar_neighbors.hash(state);
     }
 }
 
@@ -189,9 +201,54 @@ fn preview_worker(params: &PreviewParams) -> iced::futures::stream::BoxStream<'s
             if params.exposure >= 0 {
                 let _ = cam.set_exposure(params.exposure as f64);
             }
+            let mut detector = match create_detector(
+                Some(&params.yunet_path).filter(|p| !p.is_empty()).map(|x| x.as_str()),
+                &params.model_path,
+                params.confidence_threshold,
+                params.nms_threshold,
+                params.use_cnn,
+                enroll::DEFAULT_HAAR_CASCADE,
+                params.haar_neighbors,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = output.try_send(Message::PreviewError(format!("Detector init failed: {e}")));
+                    return;
+                }
+            };
             loop {
                 match cam.read_frame() {
-                    Ok((color, _)) => {
+                    Ok((mut color, _)) => {
+                        if let Ok(faces) = detector.detect(&color) {
+                            for face in faces {
+                                let bbox = face.bbox;
+                                let _ = imgproc::rectangle(
+                                    &mut color,
+                                    Rect::new(bbox.x, bbox.y, bbox.width, bbox.height),
+                                    Scalar::new(0.0, 255.0, 0.0, 0.0),
+                                    2,
+                                    imgproc::LINE_8,
+                                    0,
+                                );
+                                for (i, pt) in face.landmarks.iter().enumerate() {
+                                    let color_scalar = match i {
+                                        0 | 1 => Scalar::new(0.0, 0.0, 255.0, 0.0), // eyes - red
+                                        2 => Scalar::new(0.0, 255.0, 0.0, 0.0),     // nose - green
+                                        3 | 4 => Scalar::new(255.0, 0.0, 0.0, 0.0), // mouth corners - blue
+                                        _ => Scalar::new(255.0, 255.0, 255.0, 0.0),
+                                    };
+                                    let _ = imgproc::circle(
+                                        &mut color,
+                                        Point::new(pt.x as i32, pt.y as i32),
+                                        3,
+                                        color_scalar,
+                                        -1,
+                                        imgproc::LINE_8,
+                                        0,
+                                    );
+                                }
+                            }
+                        }
                         let (w, h, rgba) = match mat_bgr_to_rgba(&color) {
                             Ok(v) => v,
                             Err(_) => continue,
@@ -311,6 +368,12 @@ fn update(state: &mut FaceauthUi, message: Message) -> Task<Message> {
                     max_height: state.base_config.video.max_height,
                     rotate: state.base_config.video.rotate,
                     exposure: state.base_config.video.exposure,
+                    yunet_path: state.base_config.detection.yunet_path.clone(),
+                    model_path: state.base_config.detection.model_path.clone(),
+                    confidence_threshold: state.base_config.detection.confidence_threshold as f32,
+                    nms_threshold: state.base_config.detection.nms_threshold as f32,
+                    use_cnn: state.base_config.detection.use_cnn,
+                    haar_neighbors: if state.ir { 2 } else { 3 },
                 });
                 state.status = "Opening camera...".to_string();
             } else {
