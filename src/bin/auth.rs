@@ -1,14 +1,15 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use opencv::prelude::MatTraitConst;
 use std::env;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use opencv::prelude::MatTraitConst;
+
 use faceauth::camera;
 use faceauth::config::Config;
 use faceauth::database::{Database, get_user_model_path};
-use faceauth::detection::HaarCascadeDetector;
+use faceauth::detection::{create_detector, crop_face};
 use faceauth::logger;
 use faceauth::recognition::FaceRecognizer;
 
@@ -78,7 +79,6 @@ fn main() -> Result<()> {
     let db = Database::load(&model_path)?;
     if db.get_user(&user).is_none() {
         log::error!("No face model found for user {}", user);
-
         std::process::exit(10); // Howdy uses exit code 10 for missing model
     }
 
@@ -98,10 +98,15 @@ fn main() -> Result<()> {
     }
 
     let haar_neighbors = if config.video.ir_mode { 2 } else { 3 };
-    let mut detector = HaarCascadeDetector::with_min_neighbors(
+    let mut detector = create_detector(
+        &config.detection.model_path,
+        config.detection.confidence_threshold as f32,
+        config.detection.nms_threshold as f32,
+        config.detection.use_cnn,
         "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
         haar_neighbors,
-    )?;
+    )
+    .context("Failed to initialize face detector")?;
 
     // Initialize face recognizer
     let mut recognizer = FaceRecognizer::load(&config.recognition.model_path)
@@ -149,13 +154,30 @@ fn main() -> Result<()> {
             }
         };
 
-        for face in faces {
-            if face.confidence < config.detection.confidence_threshold as f32 {
-                continue;
-            }
+        // Filter faces by size and confidence
+        let img_area = color.rows() * color.cols();
+        let min_area = (img_area as f64 * config.detection.min_face_size_ratio).max(1.0) as i32;
+        let max_area = (img_area as f64 * config.detection.max_face_size_ratio).max(1.0) as i32;
 
-            // Crop face
-            let crop = color.roi(face.bbox)?.try_clone()?;
+        let valid_faces: Vec<_> = faces
+            .into_iter()
+            .filter(|f| {
+                let area = f.bbox.width * f.bbox.height;
+                area >= min_area && area <= max_area
+                    && f.confidence >= config.detection.confidence_threshold as f32
+            })
+            .collect();
+
+        for face in valid_faces {
+            // Crop face with padding (adds context like ears/chin for better recognition)
+            let crop = match crop_face(&color, &face.bbox, config.detection.face_padding) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("Failed to crop face: {}", e);
+                    continue;
+                }
+            };
+
             // Extract embedding
             let embedding = match recognizer.extract(&crop) {
                 Ok(emb) => emb,
@@ -171,19 +193,21 @@ fn main() -> Result<()> {
                 log::info!("Authentication successful for {}", user);
                 std::process::exit(0);
             } else {
-                // Update lowest certainty
-                let cert = embedding.euclidean_distance(&embedding); // placeholder
-                if cert < lowest_certainty {
-                    lowest_certainty = cert;
+                // Update lowest distance for logging
+                if let Some(model) = db.get_user(&user) {
+                    let dist = model.best_match_distance(&embedding);
+                    if dist < lowest_certainty {
+                        lowest_certainty = dist;
+                    }
                 }
             }
         }
     }
 
     // Timeout or no match
-    log::error!("Authentication failed for {}", user); // general failure
+    log::error!("Authentication failed for {}", user);
     if dark_tries == valid_frames {
-        log::error!("All frames were too dark"); // "All frames were too dark"
+        log::error!("All frames were too dark");
         std::process::exit(13); // exit code 13
     }
     std::process::exit(11); // exit code 11

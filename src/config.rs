@@ -28,7 +28,20 @@ pub struct DetectionConfig {
     pub model_path: String,
     pub use_cnn: bool,
     pub confidence_threshold: f64,
+    #[serde(default = "default_nms_threshold")]
+    pub nms_threshold: f64,
+    #[serde(default = "default_face_padding")]
+    pub face_padding: f64,
+    #[serde(default = "default_min_face_size_ratio")]
+    pub min_face_size_ratio: f64,
+    #[serde(default = "default_max_face_size_ratio")]
+    pub max_face_size_ratio: f64,
 }
+
+fn default_nms_threshold() -> f64 { 0.5 }
+fn default_face_padding() -> f64 { 0.15 }
+fn default_min_face_size_ratio() -> f64 { 0.05 }
+fn default_max_face_size_ratio() -> f64 { 0.75 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecognitionConfig {
@@ -61,6 +74,10 @@ impl Default for Config {
                 model_path: "models/ultra_light_640.onnx".to_string(),
                 use_cnn: false,
                 confidence_threshold: 0.7,
+                nms_threshold: 0.5,
+                face_padding: 0.15,
+                min_face_size_ratio: 0.05,
+                max_face_size_ratio: 0.75,
             },
             recognition: RecognitionConfig {
                 model_path: "models/mobilefacenet.onnx".to_string(),

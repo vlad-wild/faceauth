@@ -8,7 +8,7 @@ use faceauth::{
     camera,
     config,
     database::{Database, get_user_model_path},
-    detection::HaarCascadeDetector,
+    detection::create_detector,
     enroll::{self, EnrollMerge, EnrollParams},
     recognition::FaceRecognizer,
 };
@@ -291,7 +291,14 @@ fn test_auth(user: &str, timeout_override: Option<u32>, ir: bool) -> Result<()> 
 
     let mut cam = camera::Camera::open(&cfg.video.device_path, cfg.video.max_height, cfg.video.rotate)?;
     let haar_neighbors = if cfg.video.ir_mode { 2 } else { 3 };
-    let mut detector = HaarCascadeDetector::with_min_neighbors(enroll::DEFAULT_HAAR_CASCADE, haar_neighbors)?;
+    let mut detector = create_detector(
+        &cfg.detection.model_path,
+        cfg.detection.confidence_threshold as f32,
+        cfg.detection.nms_threshold as f32,
+        cfg.detection.use_cnn,
+        enroll::DEFAULT_HAAR_CASCADE,
+        haar_neighbors,
+    )?;
     let mut recognizer = FaceRecognizer::load(&cfg.recognition.model_path)?;
     let timeout_secs = timeout_override.unwrap_or(cfg.video.timeout).max(3);
     let timeout = Duration::from_secs(timeout_secs as u64);

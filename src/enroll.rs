@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use crate::camera;
 use crate::config::Config;
 use crate::database::{Database, FaceModel, get_user_model_path};
-use crate::detection::HaarCascadeDetector;
+use crate::detection::{create_detector, crop_face, Detector};
 use crate::recognition::{FaceEmbedding, FaceRecognizer};
 
 pub const DEFAULT_HAAR_CASCADE: &str =
@@ -113,7 +113,14 @@ pub fn enroll_user_with_progress(
         let _ = cam.set_exposure(cfg.video.exposure as f64);
     }
     let haar_neighbors = if cfg.video.ir_mode { 2 } else { 3 };
-    let mut detector = HaarCascadeDetector::with_min_neighbors(DEFAULT_HAAR_CASCADE, haar_neighbors)?;
+    let mut detector = create_detector(
+        &cfg.detection.model_path,
+        cfg.detection.confidence_threshold as f32,
+        cfg.detection.nms_threshold as f32,
+        cfg.detection.use_cnn,
+        DEFAULT_HAAR_CASCADE,
+        haar_neighbors,
+    )?;
     let mut recognizer = FaceRecognizer::load(&cfg.recognition.model_path)?;
 
     if cfg.video.ir_mode {
@@ -186,7 +193,7 @@ pub fn enroll_user_with_progress(
 
 pub fn capture_embeddings(
     cam: &mut camera::Camera,
-    detector: &mut HaarCascadeDetector,
+    detector: &mut Detector,
     recognizer: &mut FaceRecognizer,
     target_samples: usize,
     cfg: &Config,
@@ -204,7 +211,7 @@ pub fn capture_embeddings(
 
 pub fn capture_embeddings_with_progress(
     cam: &mut camera::Camera,
-    detector: &mut HaarCascadeDetector,
+    detector: &mut Detector,
     recognizer: &mut FaceRecognizer,
     target_samples: usize,
     cfg: &Config,
@@ -230,7 +237,7 @@ pub fn capture_embeddings_with_progress(
 
 pub fn capture_single_embedding(
     cam: &mut camera::Camera,
-    detector: &mut HaarCascadeDetector,
+    detector: &mut Detector,
     recognizer: &mut FaceRecognizer,
     cfg: &Config,
 ) -> Result<Option<FaceEmbedding>> {
@@ -259,14 +266,34 @@ pub fn capture_single_embedding(
         }
     };
     if faces.is_empty() {
-        debug!("skip frame: Haar found no faces (frontal, good light helps)");
+        debug!("skip frame: no faces detected (frontal, good light helps)");
         return Ok(None);
     }
 
-    let biggest = faces
+    // Filter faces by size ratio and pick the largest valid one
+    let img_area = color.rows() * color.cols();
+    let min_area = (img_area as f64 * cfg.detection.min_face_size_ratio).max(1.0) as i32;
+    let max_area = (img_area as f64 * cfg.detection.max_face_size_ratio).max(1.0) as i32;
+
+    let valid_faces: Vec<_> = faces
+        .into_iter()
+        .filter(|f| {
+            let area = f.bbox.width * f.bbox.height;
+            area >= min_area && area <= max_area
+        })
+        .collect();
+
+    if valid_faces.is_empty() {
+        debug!("skip frame: no faces within size constraints");
+        return Ok(None);
+    }
+
+    // Select the largest face (most likely the intended subject)
+    let biggest = valid_faces
         .into_iter()
         .max_by_key(|f| f.bbox.width * f.bbox.height)
         .context("Failed to select face candidate")?;
+
     if biggest.confidence < cfg.detection.confidence_threshold as f32 {
         debug!(
             "skip frame: confidence {:.3} < threshold {:.3}",
@@ -275,7 +302,8 @@ pub fn capture_single_embedding(
         return Ok(None);
     }
 
-    let crop = color.roi(biggest.bbox)?.try_clone()?;
+    // Crop face with padding (adds context like ears/chin for better recognition)
+    let crop = crop_face(&color, &biggest.bbox, cfg.detection.face_padding)?;
     let emb = recognizer.extract(&crop)?;
     Ok(Some(emb))
 }

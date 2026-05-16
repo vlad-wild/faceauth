@@ -10,8 +10,12 @@ ir_mode = true
 
 [detection]
 model_path = "/etc/faceauth/models/ultra_light_640.onnx"
-use_cnn = false
+use_cnn = true
 confidence_threshold = 0.7
+nms_threshold = 0.5
+face_padding = 0.15
+min_face_size_ratio = 0.05
+max_face_size_ratio = 0.75
 
 [recognition]
 model_path = "/etc/faceauth/models/MobileFaceNet.onnx"
