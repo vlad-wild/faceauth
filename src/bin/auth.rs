@@ -117,7 +117,7 @@ fn main() -> Result<()> {
     let start = Instant::now();
     let timeout = Duration::from_secs(config.video.timeout as u64);
     let dark_threshold = config.video.dark_threshold;
-    let certainty_threshold = config.video.certainty / 10.0; // convert from howdy scale
+    let threshold = config.recognition.distance_threshold as f32;
     let mut valid_frames = 0;
     let mut dark_tries = 0;
     let mut lowest_certainty = f32::INFINITY;
@@ -189,7 +189,7 @@ fn main() -> Result<()> {
             };
 
             // Verify against user's model
-            let distance = db.verify(&user, &embedding, certainty_threshold as f32);
+            let distance = db.verify(&user, &embedding, threshold);
             if distance {
                 log::info!("Authentication successful for {}", user);
                 std::process::exit(0);
