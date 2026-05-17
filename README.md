@@ -55,15 +55,15 @@ The **MobileFaceNet** model was trained mostly on RGB; IR quality may be slightl
 │ (Rust binary)   │
 └────────┬────────┘
          │ uses
-┌────────▼─────────────────────────────────────────────┐
-│ FaceAuth Libraries                                  │
-│  • camera — frame capture                          │
+┌────────▼───────────────────────────────────────────────┐
+│ FaceAuth Libraries                                     │
+│  • camera — frame capture                              │
 │  • detection — face detection (Haar / ONNX / OpenVINO) │
-│  • recognition — embeddings (ONNX / OpenVINO)      │
-│  • openvino_backend — OpenVINO inference wrapper   │
-│  • database — model storage                         │
-│  • config — TOML configuration                    │
-└──────────────────────────────────────────────────────┘
+│  • recognition — embeddings (ONNX / OpenVINO)          │
+│  • openvino_backend — OpenVINO inference wrapper       │
+│  • database — model storage                            │
+│  • config — TOML configuration                         │
+└────────────────────────────────────────────────────────┘
 ```
 
 ## Installation (for Arch Linux)
