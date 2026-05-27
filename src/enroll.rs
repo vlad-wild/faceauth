@@ -4,14 +4,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use log::{debug, info};
+use opencv::core::Mat;
 use opencv::prelude::MatTraitConst;
 use std::time::{Duration, Instant};
 
 use crate::camera;
 use crate::config::Config;
 use crate::database::{Database, FaceModel, get_user_model_path};
-use crate::detection::{create_detector, crop_face, Detector};
-use crate::recognition::{FaceEmbedding, FaceRecognizer};
+use crate::detection::{create_detector, crop_face, Detector, Face};
+use crate::recognition::{align_face, FaceEmbedding, FaceRecognizer};
 
 pub const DEFAULT_HAAR_CASCADE: &str =
     "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml";
@@ -237,21 +238,17 @@ pub fn capture_embeddings_with_progress(
     Ok(out)
 }
 
-pub fn capture_single_embedding(
-    cam: &mut camera::Camera,
-    detector: &mut Detector,
+/// Process a pre-read frame with pre-detected faces and extract an embedding
+/// from the best valid face. Returns `None` if no suitable face is found.
+/// This is the core logic extracted from `capture_single_embedding`.
+pub fn process_face_sample(
+    color: &Mat,
+    gray: &Mat,
+    faces: Vec<Face>,
     recognizer: &mut FaceRecognizer,
     cfg: &Config,
 ) -> Result<Option<FaceEmbedding>> {
-    let (color, gray) = match cam.read_frame() {
-        Ok(frames) => frames,
-        Err(e) => {
-            debug!("skip frame: read_frame failed: {e}");
-            return Ok(None);
-        }
-    };
-
-    let darkness = camera::darkness(&gray)?;
+    let darkness = camera::darkness(gray)?;
     if !cfg.video.ir_mode && darkness > cfg.video.dark_threshold {
         debug!(
             "skip frame: darkness {:.1}% > threshold {:.1}%",
@@ -260,13 +257,6 @@ pub fn capture_single_embedding(
         return Ok(None);
     }
 
-    let faces = match detector.detect(&color) {
-        Ok(faces) => faces,
-        Err(e) => {
-            debug!("skip frame: detect failed: {e}");
-            return Ok(None);
-        }
-    };
     if faces.is_empty() {
         debug!("skip frame: no faces detected (frontal, good light helps)");
         return Ok(None);
@@ -304,8 +294,37 @@ pub fn capture_single_embedding(
         return Ok(None);
     }
 
-    // Crop face with padding (adds context like ears/chin for better recognition)
-    let crop = crop_face(&color, &biggest.bbox, cfg.detection.face_padding)?;
+    // Crop / align face region for the recognizer
+    let crop = if biggest.landmarks.len() >= 2 {
+        align_face(color, &biggest.landmarks, 112)?
+    } else {
+        crop_face(color, &biggest.bbox, cfg.detection.face_padding)?
+    };
     let emb = recognizer.extract(&crop)?;
     Ok(Some(emb))
+}
+
+pub fn capture_single_embedding(
+    cam: &mut camera::Camera,
+    detector: &mut Detector,
+    recognizer: &mut FaceRecognizer,
+    cfg: &Config,
+) -> Result<Option<FaceEmbedding>> {
+    let (color, gray) = match cam.read_frame() {
+        Ok(frames) => frames,
+        Err(e) => {
+            debug!("skip frame: read_frame failed: {e}");
+            return Ok(None);
+        }
+    };
+
+    let faces = match detector.detect(&color) {
+        Ok(faces) => faces,
+        Err(e) => {
+            debug!("skip frame: detect failed: {e}");
+            return Ok(None);
+        }
+    };
+
+    process_face_sample(&color, &gray, faces, recognizer, cfg)
 }

@@ -7,12 +7,15 @@ FaceAuth is a Linux facial authentication system written in Rust, inspired by th
 ## Features
 
 - **Video capture** via OpenCV with manual exposure and rotation control.
-- **Face detection** using Haar cascades (OpenCV), ONNX models (e.g., UltraLightFaceDetector), or OpenVINO-accelerated inference on Intel NPU / GPU / CPU.
+- **Face detection** using YuNet ONNX (preferred, provides 5-point landmarks), Ultra-Light ONNX/OpenVINO, or Haar cascades (fallback).
+- **Face alignment** via 5-point least-squares affine transform — corrects in-plane rotation and partially compensates for yaw/pitch, improving recognition at non-frontal angles.
+- **Embedding extraction** with neural network models (MobileFaceNet, ArcFace, etc.) via ONNX Runtime or OpenVINO.
 - **Embedding extraction** with neural network models (MobileFaceNet, ArcFace, etc.) via ONNX Runtime or OpenVINO.
 - **Automatic hardware acceleration** — OpenVINO backend automatically selects the best available device (NPU → GPU → CPU).
 - **Comparison with reference models** using threshold checks.
 - **PAM integration** via the `faceauth-auth` daemon (uses `pam_exec`).
 - **CLI for management** of user models, configuration, and testing.
+- **Graphical UI** (`faceauth-ui`) with live camera preview, real-time face detection overlay, and progress during enrollment and authentication tests.
 - **Comparison with reference models** using threshold checks.
 - **IR camera support** — works with infrared cameras (e.g., Windows Hello) via exposure settings and device selection.
 
@@ -55,15 +58,15 @@ The **MobileFaceNet** model was trained mostly on RGB; IR quality may be slightl
 │ (Rust binary)   │
 └────────┬────────┘
          │ uses
-┌────────▼───────────────────────────────────────────────┐
-│ FaceAuth Libraries                                     │
-│  • camera — frame capture                              │
-│  • detection — face detection (Haar / ONNX / OpenVINO) │
-│  • recognition — embeddings (ONNX / OpenVINO)          │
-│  • openvino_backend — OpenVINO inference wrapper       │
-│  • database — model storage                            │
-│  • config — TOML configuration                         │
-└────────────────────────────────────────────────────────┘
+┌────────▼─────────────────────────────────────────────┐
+│ FaceAuth Libraries                                  │
+│  • camera — frame capture                          │
+│  • detection — face detection (YuNet / Ultra-Light / Haar) │
+│  • recognition — face alignment + embeddings (ONNX / OpenVINO) │
+│  • openvino_backend — OpenVINO inference wrapper   │
+│  • database — model storage                         │
+│  • config — TOML configuration                    │
+└──────────────────────────────────────────────────────┘
 ```
 
 ## Installation (for Arch Linux)
@@ -214,7 +217,7 @@ Then ensure `/opt/openvino-runtime/lib/python3.x/site-packages/openvino/libs` (o
 
 ## Graphical Interface (`faceauth-ui`)
 
-Camera preview window for face capture without CLI: preview, capture progress, same settings as `faceauth add`.
+Camera preview window for face capture without CLI: live camera feed with face detection overlay (bounding box + landmarks), real-time preview during enrollment and authentication testing, progress bar, and IR mode toggle.
 
 ```bash
 cargo run --release --bin faceauth-ui
@@ -271,15 +274,15 @@ save_successful = false
 src/
 ├── camera.rs            # Video capture, frame processing
 ├── config.rs            # Config load/save
-├── detection.rs         # Face detection (Haar / ONNX / OpenVINO)
+├── detection.rs         # Face detection (YuNet / Ultra-Light / Haar)
 ├── enroll.rs            # Model enrollment (CLI + UI)
-├── recognition.rs       # Embedding extraction (ONNX / OpenVINO)
+├── recognition.rs       # Face alignment + embedding extraction (ONNX / OpenVINO)
 ├── openvino_backend.rs  # OpenVINO inference wrapper (auto NPU → GPU → CPU)
 ├── database.rs          # Model storage and comparison
 ├── main.rs              # CLI utility
 └── bin/
     ├── auth.rs          # PAM daemon
-    └── ui.rs            # Face capture window
+    └── ui.rs            # Face capture window (Iced)
 ```
 
 ### Adding New Recognition Model

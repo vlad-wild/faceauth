@@ -1,15 +1,19 @@
 # Maintainer: Vlad Wild <ya.vlash1@yandex.ru>
 pkgname=faceauth
-pkgver=0.2.5
+pkgver=0.2.6
 pkgrel=1
-pkgdesc="Face authentication system for Linux using OpenCV/ONNX"
+pkgdesc="Face authentication system for Linux using OpenVINO/ONNX"
 arch=('x86_64' 'aarch64')
 url="https://github.com/vlad-wild/faceauth"
 license=('MIT')
 depends=('opencv' 'v4l-utils' 'pam')
+optdepends=('openvino: OpenVINO backend for NPU/GPU/CPU acceleration')
 makedepends=('rust' 'cargo' 'clang' 'llvm' 'pkgconf')
+backup=('etc/faceauth/config.toml')
 source=("git+$url.git")
 sha256sums=('SKIP')
+
+options=(!lto)
 
 prepare() {
   cd "$pkgname"

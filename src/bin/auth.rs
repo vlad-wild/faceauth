@@ -11,7 +11,7 @@ use faceauth::config::Config;
 use faceauth::database::{Database, get_user_model_path_for_user};
 use faceauth::detection::{create_detector, crop_face};
 use faceauth::logger;
-use faceauth::recognition::FaceRecognizer;
+use faceauth::recognition::{align_face, FaceRecognizer};
 
 #[derive(Parser)]
 #[command(name = "faceauth-auth")]
@@ -171,12 +171,22 @@ fn main() -> Result<()> {
             .collect();
 
         for face in valid_faces {
-            // Crop face with padding (adds context like ears/chin for better recognition)
-            let crop = match crop_face(&color, &face.bbox, config.detection.face_padding) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("Failed to crop face: {}", e);
-                    continue;
+            // Crop / align face region for the recognizer
+            let crop = if face.landmarks.len() >= 2 {
+                match align_face(&color, &face.landmarks, 112) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::warn!("Face alignment failed: {}", e);
+                        continue;
+                    }
+                }
+            } else {
+                match crop_face(&color, &face.bbox, config.detection.face_padding) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::warn!("Failed to crop face: {}", e);
+                        continue;
+                    }
                 }
             };
 

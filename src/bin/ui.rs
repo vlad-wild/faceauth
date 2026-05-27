@@ -12,7 +12,7 @@ use opencv::prelude::{MatTraitConst, MatTraitConstManual};
 
 use faceauth::camera::Camera;
 use faceauth::config::Config;
-use faceauth::database::{Database, get_user_model_path};
+use faceauth::database::{Database, FaceModel, get_user_model_path};
 use faceauth::detection::create_detector;
 use faceauth::enroll::{self, EnrollMerge, EnrollParams};
 use faceauth::logger;
@@ -275,12 +275,203 @@ fn enroll_worker(job: &EnrollJob) -> iced::futures::stream::BoxStream<'static, M
     let job = job.clone();
     iced::stream::channel(16, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
         std::thread::spawn(move || {
+            // Give the preview thread time to release the camera device
+            std::thread::sleep(Duration::from_millis(300));
+
             let EnrollJob { cfg, params, .. } = job;
-            let mut output2 = output.clone();
-            let r = enroll::enroll_user_with_progress(cfg, params, move |c, t| {
-                let _ = output2.try_send(Message::EnrollSample(c, t));
-            });
-            let _ = output.try_send(Message::EnrollDone(r.map_err(|e| e.to_string())));
+
+            let mut cam = match Camera::open(
+                &params.device,
+                cfg.video.max_height,
+                cfg.video.rotate,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = output.try_send(Message::EnrollDone(Err(e.to_string())));
+                    return;
+                }
+            };
+            if cfg.video.exposure >= 0 {
+                let _ = cam.set_exposure(cfg.video.exposure as f64);
+            }
+
+            let haar_neighbors = if cfg.video.ir_mode { 2 } else { 3 };
+            let mut detector = match create_detector(
+                Some(&cfg.detection.yunet_path)
+                    .filter(|p| !p.is_empty())
+                    .map(|x| x.as_str()),
+                &cfg.detection.model_path,
+                cfg.detection.confidence_threshold as f32,
+                cfg.detection.nms_threshold as f32,
+                cfg.detection.use_cnn,
+                enroll::DEFAULT_HAAR_CASCADE,
+                haar_neighbors,
+                cfg.detection.use_openvino,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = output.try_send(Message::EnrollDone(Err(e.to_string())));
+                    return;
+                }
+            };
+
+            let mut recognizer = match FaceRecognizer::load(
+                &cfg.recognition.model_path,
+                cfg.recognition.use_openvino,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = output.try_send(Message::EnrollDone(Err(e.to_string())));
+                    return;
+                }
+            };
+
+            let target = params.samples;
+            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(target);
+            let started = Instant::now();
+            let timeout =
+                Duration::from_secs((cfg.video.timeout as u64).saturating_mul(3).max(6));
+
+            while vectors.len() < target && started.elapsed() < timeout {
+                let (mut color, gray) = match cam.read_frame() {
+                    Ok(frames) => frames,
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                };
+
+                let faces = match detector.detect(&color) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+
+                // Draw bounding box & landmarks on the frame for preview
+                for face in &faces {
+                    let bbox = face.bbox;
+                    let _ = imgproc::rectangle(
+                        &mut color,
+                        Rect::new(bbox.x, bbox.y, bbox.width, bbox.height),
+                        Scalar::new(0.0, 255.0, 0.0, 0.0),
+                        2,
+                        imgproc::LINE_8,
+                        0,
+                    );
+                    for (i, pt) in face.landmarks.iter().enumerate() {
+                        let c = match i {
+                            0 | 1 => Scalar::new(0.0, 0.0, 255.0, 0.0),
+                            2 => Scalar::new(0.0, 255.0, 0.0, 0.0),
+                            3 | 4 => Scalar::new(255.0, 0.0, 0.0, 0.0),
+                            _ => Scalar::new(255.0, 255.0, 255.0, 0.0),
+                        };
+                        let _ = imgproc::circle(
+                            &mut color,
+                            Point::new(pt.x as i32, pt.y as i32),
+                            3,
+                            c,
+                            -1,
+                            imgproc::LINE_8,
+                            0,
+                        );
+                    }
+                }
+
+                // Send preview frame
+                if let Ok((w, h, rgba)) = mat_bgr_to_rgba(&color) {
+                    let _ = output.try_send(Message::PreviewFrame(w, h, rgba));
+                }
+
+                // Try to extract an embedding from the same frame
+                match enroll::process_face_sample(&color, &gray, faces, &mut recognizer, &cfg) {
+                    Ok(Some(emb)) => {
+                        vectors.push(emb.vector);
+                        let _ = output.try_send(Message::EnrollSample(vectors.len(), target));
+                        std::thread::sleep(Duration::from_millis(220));
+                    }
+                    _ => {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+
+            if vectors.is_empty() {
+                let _ = output.try_send(Message::EnrollDone(
+                    Err("Could not collect any valid face samples".to_string()),
+                ));
+                return;
+            }
+
+            // Save model to database
+            let model_path = match get_user_model_path(&params.username) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = output.try_send(Message::EnrollDone(Err(e.to_string())));
+                    return;
+                }
+            };
+            let mut db = match Database::load(&model_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = output.try_send(Message::EnrollDone(Err(e.to_string())));
+                    return;
+                }
+            };
+
+            match params.merge {
+                EnrollMerge::ReplaceAll => {
+                    let model_label = params
+                        .label
+                        .unwrap_or_else(|| format!("{}-default", params.username));
+                    let model = FaceModel::new(model_label, vectors);
+                    db.add_model(params.username.clone(), model);
+                }
+                EnrollMerge::AppendPrimary => {
+                    if let Some(m) = db.users.get_mut(&params.username) {
+                        m.embeddings.extend(vectors);
+                    } else {
+                        let model_label = params
+                            .label
+                            .unwrap_or_else(|| format!("{}-default", params.username));
+                        db.add_model(
+                            params.username.clone(),
+                            FaceModel::new(model_label, vectors),
+                        );
+                    }
+                }
+                EnrollMerge::ReplaceVariant | EnrollMerge::AppendVariant => {
+                    let vname = params
+                        .variant
+                        .as_ref()
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    if vname.is_empty() {
+                        let _ = output.try_send(Message::EnrollDone(
+                            Err("variant name is empty".to_string()),
+                        ));
+                        return;
+                    }
+                    let append = params.merge == EnrollMerge::AppendVariant;
+                    if let Some(m) = db.users.get_mut(&params.username) {
+                        m.upsert_extension(vname.clone(), vectors, append);
+                    } else {
+                        let model_label = params
+                            .label
+                            .unwrap_or_else(|| format!("{}-default", params.username));
+                        let mut m = FaceModel::new(model_label, Vec::new());
+                        m.upsert_extension(vname.clone(), vectors, append);
+                        db.add_model(params.username.clone(), m);
+                    }
+                }
+            }
+
+            match db.save(&model_path) {
+                Ok(()) => {
+                    let _ = output.try_send(Message::EnrollDone(Ok(())));
+                }
+                Err(e) => {
+                    let _ = output.try_send(Message::EnrollDone(Err(e.to_string())));
+                }
+            }
         });
     })
     .boxed()
@@ -290,66 +481,155 @@ fn test_worker(job: &TestJob) -> iced::futures::stream::BoxStream<'static, Messa
     let job = job.clone();
     iced::stream::channel(16, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
         std::thread::spawn(move || {
+            // Give the preview thread time to release the camera device
+            std::thread::sleep(Duration::from_millis(300));
+
             let TestJob { cfg, username, .. } = job;
-            let result = (|| -> anyhow::Result<bool> {
-                let model_path = get_user_model_path(&username)?;
-                let db = Database::load(&model_path)?;
-                if db.get_user(&username).is_none() {
-                    anyhow::bail!("No model enrolled for user {}", username);
+
+            let model_path = match get_user_model_path(&username) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = output.try_send(Message::TestResult(Err(e.to_string())));
+                    return;
+                }
+            };
+            let db = match Database::load(&model_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = output.try_send(Message::TestResult(Err(e.to_string())));
+                    return;
+                }
+            };
+            if db.get_user(&username).is_none() {
+                let _ = output.try_send(Message::TestResult(
+                    Err("No model enrolled for user".to_string()),
+                ));
+                return;
+            }
+
+            let mut cam = match Camera::open(
+                &cfg.video.device_path,
+                cfg.video.max_height,
+                cfg.video.rotate,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ =
+                        output.try_send(Message::TestResult(Err(format!("Failed to open camera: {e}"))));
+                    return;
+                }
+            };
+            if cfg.video.exposure >= 0 {
+                let _ = cam.set_exposure(cfg.video.exposure as f64);
+            }
+
+            let haar_neighbors = if cfg.video.ir_mode { 2 } else { 3 };
+            let mut detector = match create_detector(
+                Some(&cfg.detection.yunet_path)
+                    .filter(|p| !p.is_empty())
+                    .map(|x| x.as_str()),
+                &cfg.detection.model_path,
+                cfg.detection.confidence_threshold as f32,
+                cfg.detection.nms_threshold as f32,
+                cfg.detection.use_cnn,
+                enroll::DEFAULT_HAAR_CASCADE,
+                haar_neighbors,
+                cfg.detection.use_openvino,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = output.try_send(Message::TestResult(Err(e.to_string())));
+                    return;
+                }
+            };
+
+            let mut recognizer = match FaceRecognizer::load(
+                &cfg.recognition.model_path,
+                cfg.recognition.use_openvino,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = output.try_send(Message::TestResult(Err(e.to_string())));
+                    return;
+                }
+            };
+
+            let timeout =
+                Duration::from_secs(cfg.video.timeout as u64).max(Duration::from_secs(3));
+            let started = Instant::now();
+            let threshold = cfg.recognition.distance_threshold as f32;
+
+            let probe = loop {
+                if started.elapsed() >= timeout {
+                    let _ = output.try_send(Message::TestResult(
+                        Err("Timeout: no face detected during test".to_string()),
+                    ));
+                    return;
                 }
 
-                let mut cam = Camera::open(&cfg.video.device_path, cfg.video.max_height, cfg.video.rotate)
-                    .map_err(|e| anyhow::anyhow!("Failed to open camera: {e}"))?;
-                if cfg.video.exposure >= 0 {
-                    let _ = cam.set_exposure(cfg.video.exposure as f64);
-                }
-
-                let haar_neighbors = if cfg.video.ir_mode { 2 } else { 3 };
-                let mut detector = create_detector(
-                    Some(&cfg.detection.yunet_path).filter(|p| !p.is_empty()).map(|x| x.as_str()),
-                    &cfg.detection.model_path,
-                    cfg.detection.confidence_threshold as f32,
-                    cfg.detection.nms_threshold as f32,
-                    cfg.detection.use_cnn,
-                    enroll::DEFAULT_HAAR_CASCADE,
-                    haar_neighbors,
-                    cfg.detection.use_openvino,
-                ).map_err(|e| anyhow::anyhow!("Detector init failed: {e}"))?;
-
-                let mut recognizer = FaceRecognizer::load(&cfg.recognition.model_path, cfg.recognition.use_openvino)
-                    .map_err(|e| anyhow::anyhow!("Recognizer load failed: {e}"))?;
-
-                let timeout = Duration::from_secs(cfg.video.timeout as u64).max(Duration::from_secs(3));
-                let started = Instant::now();
-                let probe = loop {
-                    if started.elapsed() >= timeout {
-                        anyhow::bail!("Timeout: no face detected during test");
-                    }
-                    match enroll::capture_single_embedding(&mut cam, &mut detector, &mut recognizer, &cfg) {
-                        Ok(Some(emb)) => break emb,
-                        Ok(None) => {
-                            std::thread::sleep(Duration::from_millis(60));
-                            continue;
-                        }
-                        Err(e) => anyhow::bail!("Capture error: {e}"),
+                let (mut color, gray) = match cam.read_frame() {
+                    Ok(frames) => frames,
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
                     }
                 };
 
-                let threshold = cfg.recognition.distance_threshold as f32;
-                let distance = db
-                    .get_user(&username)
-                    .map(|m| m.best_match_distance(&probe))
-                    .ok_or_else(|| anyhow::anyhow!("User model disappeared"))?;
+                let faces = match detector.detect(&color) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
 
-                Ok(distance < threshold)
-            })();
+                // Draw bounding box & landmarks on the frame for preview
+                for face in &faces {
+                    let bbox = face.bbox;
+                    let _ = imgproc::rectangle(
+                        &mut color,
+                        Rect::new(bbox.x, bbox.y, bbox.width, bbox.height),
+                        Scalar::new(0.0, 255.0, 0.0, 0.0),
+                        2,
+                        imgproc::LINE_8,
+                        0,
+                    );
+                    for (i, pt) in face.landmarks.iter().enumerate() {
+                        let c = match i {
+                            0 | 1 => Scalar::new(0.0, 0.0, 255.0, 0.0),
+                            2 => Scalar::new(0.0, 255.0, 0.0, 0.0),
+                            3 | 4 => Scalar::new(255.0, 0.0, 0.0, 0.0),
+                            _ => Scalar::new(255.0, 255.0, 255.0, 0.0),
+                        };
+                        let _ = imgproc::circle(
+                            &mut color,
+                            Point::new(pt.x as i32, pt.y as i32),
+                            3,
+                            c,
+                            -1,
+                            imgproc::LINE_8,
+                            0,
+                        );
+                    }
+                }
 
-            let msg = match result {
-                Ok(true) => Message::TestResult(Ok(true)),
-                Ok(false) => Message::TestResult(Ok(false)),
-                Err(e) => Message::TestResult(Err(e.to_string())),
+                // Send preview frame
+                if let Ok((w, h, rgba)) = mat_bgr_to_rgba(&color) {
+                    let _ = output.try_send(Message::PreviewFrame(w, h, rgba));
+                }
+
+                // Try to extract a probe embedding from this frame
+                match enroll::process_face_sample(&color, &gray, faces, &mut recognizer, &cfg) {
+                    Ok(Some(emb)) => break emb,
+                    _ => {
+                        std::thread::sleep(Duration::from_millis(60));
+                    }
+                }
             };
-            let _ = output.try_send(msg);
+
+            let distance = db
+                .get_user(&username)
+                .map(|m| m.best_match_distance(&probe))
+                .unwrap();
+            let pass = distance < threshold;
+            let _ = output.try_send(Message::TestResult(Ok(pass)));
         });
     })
     .boxed()
@@ -389,7 +669,9 @@ fn update(state: &mut FaceauthUi, message: Message) -> Task<Message> {
         }
         Message::PreviewFrame(w, h, bytes) => {
             state.preview_handle = Some(image::Handle::from_rgba(w, h, bytes));
-            state.status = "Camera is opened.".to_string();
+            if state.preview_on {
+                state.status = "Camera is opened.".to_string();
+            }
         }
         Message::PreviewError(e) => {
             state.preview_on = false;
@@ -605,6 +887,7 @@ fn view(state: &FaceauthUi) -> Element<'_, Message> {
         row![
             text("Shots:"),
             slider(1..=30, state.samples, Message::SamplesChanged).width(Length::Fixed(200.0)),
+            text(state.samples.to_string()).size(16),
         ]
         .spacing(10)
         .align_y(Alignment::Center),
