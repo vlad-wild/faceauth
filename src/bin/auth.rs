@@ -1,28 +1,41 @@
+//! `faceauth-auth`: PAM helper run by `pam_exec` (as root).
+//!
+//! Exit codes (anything but 0 lets PAM fall through to the password):
+//! * 0  — face matched
+//! * 10 — skipped: face auth disabled, remote session, lid closed, or no model enrolled
+//! * 11 — no match before the timeout
+//! * 12 — setup error (config, camera, models, untrusted model file)
+//! * 13 — every frame was too dark
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::env;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use opencv::prelude::MatTraitConst;
-
-use faceauth::camera;
-use faceauth::config::Config;
-use faceauth::database::{Database, get_user_model_path_for_user};
-use faceauth::detection::{create_detector, crop_face};
+use faceauth::authenticate::{AuthOutcome, authenticate};
+use faceauth::config::{Config, SYSTEM_CONFIG_PATH};
+use faceauth::database::{DISABLED_FLAG, load_user_model};
 use faceauth::logger;
-use faceauth::recognition::{align_face, FaceRecognizer};
+use faceauth::pipeline::Pipeline;
+use faceauth::session;
+
+const EXIT_SUCCESS: i32 = 0;
+const EXIT_SKIPPED: i32 = 10;
+const EXIT_NO_MATCH: i32 = 11;
+const EXIT_SETUP_ERROR: i32 = 12;
+const EXIT_TOO_DARK: i32 = 13;
 
 #[derive(Parser)]
 #[command(name = "faceauth-auth")]
-#[command(about = "Face authentication daemon for PAM integration")]
+#[command(about = "Face authentication helper for PAM (pam_exec)")]
 struct Args {
-    /// Username to authenticate (optional)
+    /// Username to authenticate (default: PAM_USER)
     #[arg(short, long)]
     user: Option<String>,
 
     /// Configuration file path
-    #[arg(short, long, default_value = "/etc/faceauth/config.toml")]
+    #[arg(short, long, default_value = SYSTEM_CONFIG_PATH)]
     config: PathBuf,
 
     /// Verbose output
@@ -54,173 +67,95 @@ fn resolve_pam_username(cli_user: Option<String>) -> Result<String, String> {
     )
 }
 
-fn main() -> Result<()> {
+fn main() {
     logger::init_from_env();
     let args = Args::parse();
+    let code = match run(args) {
+        Ok(code) => code,
+        Err(e) => {
+            log::error!("{e:#}");
+            EXIT_SETUP_ERROR
+        }
+    };
+    std::process::exit(code);
+}
+
+fn run(args: Args) -> Result<i32> {
     if args.verbose {
         log::info!("Verbose output enabled");
     }
-
     let user = match resolve_pam_username(args.user) {
         Ok(u) => u,
         Err(msg) => {
             log::error!("{}", msg);
-            std::process::exit(10);
+            return Ok(EXIT_SKIPPED);
         }
     };
 
+    if Path::new(DISABLED_FLAG).exists() {
+        log::info!("Face authentication disabled ({DISABLED_FLAG}); skipping");
+        return Ok(EXIT_SKIPPED);
+    }
+
+    let config = Config::load_resolved(&args.config)
+        .with_context(|| format!("Failed to load config {}", args.config.display()))?;
+
+    if config.auth.skip_remote && session::is_remote_pam_session() {
+        log::info!("Remote session (PAM_RHOST/PAM_TTY); skipping face authentication");
+        return Ok(EXIT_SKIPPED);
+    }
+    if config.auth.skip_lid_closed && session::lid_closed() {
+        log::info!("Lid closed; skipping face authentication");
+        return Ok(EXIT_SKIPPED);
+    }
+
+    let Some(model) = load_user_model(&user)? else {
+        log::info!("No face model enrolled for user {}", user);
+        return Ok(EXIT_SKIPPED);
+    };
+
     log::info!("Starting face authentication for user {}", user);
-
-    // Load configuration
-    let config = Config::load(&args.config).context("Failed to load config")?;
-
-    // Load database
-    let model_path = get_user_model_path_for_user(&user)?;
-    let db = Database::load(&model_path)?;
-    if db.get_user(&user).is_none() {
-        log::error!("No face model found for user {}", user);
-        std::process::exit(10); // Howdy uses exit code 10 for missing model
-    }
-
-    // Initialize camera
-    let mut camera = camera::Camera::open(
-        &config.video.device_path,
-        config.video.max_height,
-        config.video.rotate,
-    )?;
-
-    if config.video.exposure >= 0 {
-        camera.set_exposure(config.video.exposure as f64)?;
-    }
-
     if config.video.ir_mode {
         log::info!("IR mode: darkness filter disabled; use the same IR device for enrollment");
     }
-
-    let haar_neighbors = if config.video.ir_mode { 2 } else { 3 };
-    let mut detector = create_detector(
-        Some(&config.detection.yunet_path).filter(|p| !p.is_empty()).map(|x| x.as_str()),
-        &config.detection.model_path,
-        config.detection.confidence_threshold as f32,
-        config.detection.nms_threshold as f32,
-        config.detection.use_cnn,
-        "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
-        haar_neighbors,
-        config.detection.use_openvino,
-    )
-    .context("Failed to initialize face detector")?;
-
-    // Initialize face recognizer
-    let mut recognizer = FaceRecognizer::load(&config.recognition.model_path, config.recognition.use_openvino)
-        .context("Failed to load recognition model")?;
-
-    // Main authentication loop
-    let start = Instant::now();
+    let mut pipeline = Pipeline::open(&config, &config.video.device_path)?;
     let timeout = Duration::from_secs(config.video.timeout as u64);
-    let dark_threshold = config.video.dark_threshold;
-    let threshold = config.recognition.distance_threshold as f32;
-    let mut valid_frames = 0;
-    let mut dark_tries = 0;
-    let mut lowest_certainty = f32::INFINITY;
+    let report = authenticate(&mut pipeline, &config, &model, timeout, |_| {})?;
 
-    while start.elapsed() < timeout {
-        // Read frame
-        let (color, gray) = match camera.read_frame() {
-            Ok(frames) => frames,
-            Err(e) => {
-                log::warn!("Failed to read frame: {}", e);
-                continue;
-            }
-        };
-
-        // Check darkness
-        let darkness = match camera::darkness(&gray) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        if darkness >= 100.0 {
-            continue;
-        }
-        valid_frames += 1;
-        if !config.video.ir_mode && darkness > dark_threshold {
-            dark_tries += 1;
-            continue;
-        }
-
-        // Detect faces
-        let faces = match detector.detect(&color) {
-            Ok(faces) => faces,
-            Err(e) => {
-                log::warn!("Detection error: {}", e);
-                continue;
-            }
-        };
-
-        // Filter faces by size and confidence
-        let img_area = color.rows() * color.cols();
-        let min_area = (img_area as f64 * config.detection.min_face_size_ratio).max(1.0) as i32;
-        let max_area = (img_area as f64 * config.detection.max_face_size_ratio).max(1.0) as i32;
-
-        let valid_faces: Vec<_> = faces
-            .into_iter()
-            .filter(|f| {
-                let area = f.bbox.width * f.bbox.height;
-                area >= min_area && area <= max_area
-                    && f.confidence >= config.detection.confidence_threshold as f32
-            })
-            .collect();
-
-        for face in valid_faces {
-            // Crop / align face region for the recognizer
-            let crop = if face.landmarks.len() >= 2 {
-                match align_face(&color, &face.landmarks, 112) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        log::warn!("Face alignment failed: {}", e);
-                        continue;
-                    }
-                }
-            } else {
-                match crop_face(&color, &face.bbox, config.detection.face_padding) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        log::warn!("Failed to crop face: {}", e);
-                        continue;
-                    }
-                }
-            };
-
-            // Extract embedding
-            let embedding = match recognizer.extract(&crop) {
-                Ok(emb) => emb,
-                Err(e) => {
-                    log::warn!("Embedding extraction failed: {}", e);
-                    continue;
-                }
-            };
-
-            // Verify against user's model
-            let distance = db.verify(&user, &embedding, threshold);
-            if distance {
-                log::info!("Authentication successful for {}", user);
-                std::process::exit(0);
-            } else {
-                // Update lowest distance for logging
-                if let Some(model) = db.get_user(&user) {
-                    let dist = model.best_match_distance(&embedding);
-                    if dist < lowest_certainty {
-                        lowest_certainty = dist;
-                    }
-                }
-            }
-        }
+    if config.debug.end_report {
+        log::info!("Report for {}: {}", user, report.summary());
     }
-
-    // Timeout or no match
-    log::error!("Authentication failed for {}", user);
-    if dark_tries == valid_frames {
-        log::error!("All frames were too dark");
-        std::process::exit(13); // exit code 13
-    }
-    std::process::exit(11); // exit code 11
+    Ok(match report.outcome {
+        AuthOutcome::Success => {
+            log::info!(
+                "Authentication successful for {} (score {:.4})",
+                user,
+                report.best_score
+            );
+            EXIT_SUCCESS
+        }
+        AuthOutcome::NoMatch => {
+            log::warn!(
+                "Authentication failed for {} (best score {:.4}, threshold {:.4})",
+                user,
+                report.best_score,
+                config.recognition.distance_threshold
+            );
+            EXIT_NO_MATCH
+        }
+        AuthOutcome::AllDark => {
+            log::error!(
+                "Authentication failed for {}: all frames were too dark",
+                user
+            );
+            EXIT_TOO_DARK
+        }
+        AuthOutcome::NoFrames => {
+            log::error!(
+                "Authentication failed for {}: camera delivered no frames",
+                user
+            );
+            EXIT_SETUP_ERROR
+        }
+    })
 }
