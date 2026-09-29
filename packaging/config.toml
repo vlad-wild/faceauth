@@ -1,0 +1,56 @@
+# faceauth system configuration (/etc/faceauth/config.toml).
+# Every key is optional; missing keys use the defaults shown here.
+# Run `sudo faceauth doctor` after editing.
+
+[video]
+# Camera used by faceauth-auth AND by `faceauth add` (enroll and authenticate on the same device).
+# List devices with: v4l2-ctl --list-devices
+device_path = "/dev/video0"
+timeout = 4                # seconds before falling back to the password
+dark_threshold = 85.0      # 100 − mean brightness %; RGB frames above this are skipped (ignored in ir_mode)
+max_height = 320.0         # downscale frames taller than this
+rotate = 0                 # 1 = 90° counter-clockwise, 2 = 90° clockwise
+exposure = -1              # -1 = automatic
+ir_mode = false            # true for monochrome IR cameras (Windows Hello-style)
+frame_interval_ms = 30     # pause after a failed/black frame
+
+[detection]
+yunet_path = "/usr/share/faceauth/models/face_detection_yunet_2023mar.onnx"
+model_path = "/usr/share/faceauth/models/ultra_light_640.onnx"
+use_cnn = false            # Ultra-Light fallback when YuNet is unavailable
+confidence_threshold = 0.7
+nms_threshold = 0.5
+face_padding = 0.15
+min_face_size_ratio = 0.05
+max_face_size_ratio = 0.75
+use_openvino = true
+
+[recognition]
+model_path = "/usr/share/faceauth/models/MobileFaceNet.onnx"
+distance_threshold = 0.6   # tune with `sudo faceauth calibrate -u <user>`
+required_matches = 3       # consecutive matching frames needed
+top_k = 3                  # score = mean of the k nearest enrolled samples
+use_openvino = true
+
+[liveness]
+# IR only: reject faces that are too dark/flat in IR (phone and laptop screens).
+# Printed photos are NOT stopped by this check.
+ir_check = true
+min_face_brightness = 25.0
+min_face_stddev = 8.0
+
+[openvino]
+device = "AUTO"            # AUTO (NPU/GPU with CPU start-up), NPU, GPU or CPU
+cache_dir = "/var/cache/faceauth/openvino"
+
+[auth]
+skip_remote = true         # never use the camera for SSH / remote sessions
+skip_lid_closed = true
+
+[enroll]
+min_sharpness = 60.0       # reject blurry samples
+max_abs_yaw = 25.0
+max_abs_pitch = 20.0
+
+[debug]
+end_report = false         # log a per-attempt summary to /var/log/faceauth.log

@@ -1,8 +1,28 @@
-# Example of PAM for faceauth (see Linux pam_exec(8))
+# faceauth PAM example (installed as /usr/share/doc/faceauth/pam-example).
 #
-# Important: lines in /etc/pam.d/* DO NOT pass through the USER's shell support
-# is in progress. I can ask the user.: -what is my name
-# I'm not transmitting -you: pam_exec transmits PAM_USER (Linux-PAM) to another user.
+# Put the faceauth line FIRST in the "auth" section of the service you want,
+# e.g. /etc/pam.d/sudo, /etc/pam.d/polkit-1, your screen locker, or system-auth:
 #
-# auth [success=2 default=ignore] pam_exec.so quiet /usr/local/bin/faceauth-auth
-# auth [success=1 default=error] pam_unix.so try_first_pass is reset to zero
+#   auth  sufficient  pam_exec.so quiet /usr/bin/faceauth-auth
+#
+# "sufficient": a recognized face (exit 0) finishes authentication; any other
+# exit code is ignored and PAM continues with the next line (your password).
+# Keep a working password line below it — face auth never replaces it.
+#
+# User name: pam_exec passes PAM_USER in the environment. Do NOT write
+# "-u $USER": PAM does not expand shell variables, the literal "$USER" would be
+# used. Use "-u <name>" only to pin a single-user machine to one account.
+#
+# faceauth-auth exit codes:
+#   0   face matched
+#   10  skipped: `faceauth disable`, remote session (SSH / PAM_RHOST),
+#       lid closed, or no model enrolled for the user
+#   11  no match before the timeout ([video] timeout)
+#   12  setup error: config, camera, models, or an untrusted model file
+#   13  every frame was too dark (IR emitter off? see linux-enable-ir-emitter)
+#
+# Remote sessions are skipped on purpose ([auth] skip_remote = true): otherwise
+# whoever sits in front of the laptop could approve a `sudo` typed over SSH.
+#
+# Check the setup with:  sudo faceauth doctor
+# Logs:                   /var/log/faceauth.log  (FACEAUTH_LOG=debug for more)

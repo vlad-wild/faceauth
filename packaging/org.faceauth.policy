@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>faceauth</vendor>
+  <vendor_url>https://github.com/vlad-wild/faceauth</vendor_url>
+
+  <!--
+    Used by faceauth-ui: `pkexec /usr/bin/faceauth import|verify|list|remove|rename-variant|clear -u <you>`.
+    Users authenticate as themselves (auth_self): someone at an unlocked session
+    cannot replace the face model without the account password. faceauth itself
+    refuses, under pkexec, to touch any model other than the caller's own.
+  -->
+  <action id="org.faceauth.manage-own-model">
+    <description>Manage your enrolled face model</description>
+    <description xml:lang="ru">Управление вашей моделью лица</description>
+    <message>Authentication is required to change or check your face model</message>
+    <message xml:lang="ru">Для изменения или проверки модели лица требуется аутентификация</message>
+    <icon_name>camera-web</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/faceauth</annotate>
+  </action>
+</policyconfig>

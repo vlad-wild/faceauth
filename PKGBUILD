@@ -1,16 +1,20 @@
 # Maintainer: Vlad Wild <ya.vlash1@yandex.ru>
 pkgname=faceauth
-pkgver=0.2.6
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Face authentication system for Linux using OpenVINO/ONNX"
 arch=('x86_64' 'aarch64')
 url="https://github.com/vlad-wild/faceauth"
 license=('MIT')
 depends=('opencv' 'v4l-utils' 'pam')
-optdepends=('openvino: OpenVINO backend for NPU/GPU/CPU acceleration')
-makedepends=('rust' 'cargo' 'clang' 'llvm' 'pkgconf')
+optdepends=('openvino: OpenVINO backend for NPU/GPU/CPU acceleration'
+            'intel-npu-driver: Intel NPU support (>= 1.30 for Lunar Lake)'
+            'linux-enable-ir-emitter: turn on IR emitters that stay dark by default'
+            'polkit: enrollment and model management from faceauth-ui')
+makedepends=('rust' 'cargo' 'clang' 'llvm' 'pkgconf' 'git')
 backup=('etc/faceauth/config.toml')
-source=("git+$url.git")
+install=faceauth.install
+source=("git+$url.git#tag=v$pkgver")
 sha256sums=('SKIP')
 
 options=(!lto)
@@ -48,12 +52,20 @@ package() {
   install -Dm755 "target/release/faceauth-ui" "$pkgdir/usr/bin/faceauth-ui"
 
   # Models
-  install -Dm644 "models/MobileFaceNet.onnx" "$pkgdir/etc/faceauth/models/MobileFaceNet.onnx"
-  install -Dm644 "models/ultra_light_640.onnx" "$pkgdir/etc/faceauth/models/ultra_light_640.onnx"
-  install -Dm644 "models/face_detection_yunet_2023mar.onnx" "$pkgdir/etc/faceauth/models/face_detection_yunet_2023mar.onnx"
+  local model
+  for model in MobileFaceNet.onnx ultra_light_640.onnx face_detection_yunet_2023mar.onnx; do
+    install -Dm644 "models/$model" "$pkgdir/usr/share/faceauth/models/$model"
+  done
 
-  # Config
-  install -Dm644 "faceauth.toml" "$pkgdir/etc/faceauth/config.toml"
+  # Config (system-wide; enrollment and PAM both read it)
+  install -Dm644 "packaging/config.toml" "$pkgdir/etc/faceauth/config.toml"
+  install -Dm644 "packaging/config.toml" "$pkgdir/usr/share/doc/$pkgname/config.toml"
+
+  # Root-only model store and OpenVINO cache
+  install -Dm644 "packaging/faceauth.tmpfiles" "$pkgdir/usr/lib/tmpfiles.d/faceauth.conf"
+
+  # polkit action for faceauth-ui (pkexec faceauth import/verify/…)
+  install -Dm644 "packaging/org.faceauth.policy" "$pkgdir/usr/share/polkit-1/actions/org.faceauth.policy"
 
   # Documentation & license
   install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"

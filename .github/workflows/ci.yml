@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    # Arch ships OpenCV 5.x (build.rs enables cfg(opencv5)); Ubuntu LTS packages are
+    # older than the 4.11 minimum (AlgorithmHint) required by this code.
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install system packages
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust clang llvm pkgconf \
+            opencv vtk hdf5 glew fmt openmpi qt6-base
+
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Clippy (without OpenVINO)
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Test (without OpenVINO)
+        run: cargo test --locked --no-default-features

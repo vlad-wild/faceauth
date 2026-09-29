@@ -1,0 +1,5 @@
+# Root-only face model store and OpenVINO compiled-model cache.
+d /var/lib/faceauth              0700 root root -
+d /var/lib/faceauth/models       0700 root root -
+d /var/cache/faceauth            0755 root root -
+d /var/cache/faceauth/openvino   0755 root root -

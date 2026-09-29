@@ -1,0 +1,24 @@
+post_install() {
+  cat <<'MSG'
+==> faceauth: next steps
+    sudo faceauth doctor                 # check camera, models, NPU, PAM
+    sudo faceauth add -u "$USER"         # enroll (or use faceauth-ui)
+    sudo faceauth calibrate -u "$USER"   # tune distance_threshold
+    Then add to the top of /etc/pam.d/sudo (see /usr/share/doc/faceauth/pam-example):
+      auth sufficient pam_exec.so quiet /usr/bin/faceauth-auth
+MSG
+}
+
+post_upgrade() {
+  # 0.3.0 moved face models from ~/.local/share/faceauth (user-writable) to /var/lib/faceauth.
+  if [ "$(vercmp "$2" 0.3.0)" -lt 0 ]; then
+    cat <<'MSG'
+==> faceauth 0.3: face models now live in the root-only store /var/lib/faceauth/models.
+    Models in ~/.local/share/faceauth are no longer read. Move yours with:
+      sudo faceauth migrate -u "$USER"
+    (or re-enroll: sudo faceauth add -u "$USER"), then delete the old file.
+    Packaged ONNX models moved to /usr/share/faceauth/models; old /etc/faceauth/models
+    paths in your config keep working through an automatic fallback.
+MSG
+  fi
+}
