@@ -1,10 +1,20 @@
+pub mod authenticate;
 pub mod camera;
 pub mod config;
 pub mod database;
 pub mod detection;
+pub mod devices;
+pub mod diagnostics;
+pub mod doctor;
 pub mod enroll;
-pub mod recognition;
+pub mod i18n;
 pub mod logger;
+pub mod matching;
+pub mod pipeline;
+pub mod privilege;
+pub mod recognition;
+pub mod session;
+pub mod verdict;
 
 #[cfg(feature = "openvino")]
 pub mod openvino_backend;

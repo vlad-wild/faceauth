@@ -1,10 +1,15 @@
 use anyhow::{Context, Result};
-use log::info;
+use log::{info, warn};
 use ndarray::Array4;
-use openvino::{Core, DeviceType, ElementType, Shape, Tensor};
+use openvino::{Core, DeviceType, ElementType, PropertyKey, RwPropertyKey, Shape, Tensor};
+use std::path::PathBuf;
+
+use crate::config::OpenVinoConfig;
 
 pub struct OpenVinoSession {
-    compiled: openvino::CompiledModel,
+    // Kept alive for as long as the infer request that was created from it.
+    _compiled: openvino::CompiledModel,
+    request: openvino::InferRequest,
     input_name: String,
     output_count: usize,
     device: String,
@@ -12,7 +17,7 @@ pub struct OpenVinoSession {
 }
 
 impl OpenVinoSession {
-    pub fn from_onnx(model_path: &str) -> Result<Self> {
+    pub fn from_onnx(model_path: &str, cfg: &OpenVinoConfig) -> Result<Self> {
         let mut core = Core::new().context("Failed to initialize OpenVINO core")?;
         let onnx_data = std::fs::read(model_path)
             .with_context(|| format!("Failed to read ONNX model {}", model_path))?;
@@ -20,34 +25,56 @@ impl OpenVinoSession {
             .read_model_from_buffer(&onnx_data, None)
             .context("Failed to read ONNX model into OpenVINO")?;
 
-        let devices = core
+        let available: Vec<String> = core
             .available_devices()
-            .context("Failed to query OpenVINO devices")?;
-        let device_str: String;
-        let device = if devices.iter().any(|d| matches!(d, DeviceType::NPU)) {
-            device_str = "NPU".to_string();
-            info!("OpenVINO: NPU detected, compiling model for NPU");
-            DeviceType::NPU
-        } else if devices.iter().any(|d| matches!(d, DeviceType::GPU)) {
-            device_str = "GPU".to_string();
-            info!("OpenVINO: GPU detected, compiling model for GPU");
-            DeviceType::GPU
-        } else {
-            device_str = "CPU".to_string();
-            info!("OpenVINO: using CPU");
-            DeviceType::CPU
-        };
+            .context("Failed to query OpenVINO devices")?
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+        let (device_str, priorities) = choose_device(&cfg.device, &available);
+        let device = DeviceType::from(device_str.as_str());
 
-        let compiled = core
+        if let Some(dir) = writable_cache_dir(&cfg.cache_dir) {
+            let dir = dir.to_string_lossy().into_owned();
+            // The cache is a per-plugin property; AUTO forwards it to the device it compiles for.
+            for name in available
+                .iter()
+                .map(String::as_str)
+                .chain([device_str.as_str()])
+            {
+                let target = DeviceType::from(name);
+                if let Err(e) = core.set_property(&target, &RwPropertyKey::CacheDir, &dir) {
+                    warn!("OpenVINO: cannot set CACHE_DIR for {name}: {e}");
+                }
+            }
+        }
+        if let Some(p) = &priorities
+            && let Err(e) = core.set_property(&device, &RwPropertyKey::DevicePriorities, p)
+        {
+            warn!("OpenVINO: cannot set AUTO device priorities: {e}");
+        }
+        if let Err(e) = core.set_property(&device, &RwPropertyKey::HintPerformanceMode, "LATENCY") {
+            warn!("OpenVINO: cannot set LATENCY hint on {device_str}: {e}");
+        }
+
+        info!("OpenVINO: compiling {} for {}", model_path, device_str);
+        let mut compiled = core
             .compile_model(&model, device)
             .with_context(|| format!("Failed to compile model for {}", device_str))?;
+
+        let device_label =
+            match compiled.get_property(&PropertyKey::Other("EXECUTION_DEVICES".into())) {
+                Ok(exec) if !exec.trim().is_empty() && device_str == "AUTO" => {
+                    format!("AUTO:{}", exec.trim())
+                }
+                _ => device_str.clone(),
+            };
+        info!("OpenVINO: model ready on {}", device_label);
 
         let input_node = compiled
             .get_input_by_index(0)
             .context("Failed to get model input")?;
-        let input_name = input_node
-            .get_name()
-            .context("Failed to get input name")?;
+        let input_name = input_node.get_name().context("Failed to get input name")?;
         let input_shape = input_node
             .get_shape()
             .context("Failed to get input shape")?
@@ -57,12 +84,16 @@ impl OpenVinoSession {
         let output_count = compiled
             .get_output_size()
             .context("Failed to get output count")?;
+        let request = compiled
+            .create_infer_request()
+            .context("Failed to create OpenVINO infer request")?;
 
         Ok(Self {
-            compiled,
+            _compiled: compiled,
+            request,
             input_name,
             output_count,
-            device: device_str,
+            device: device_label,
             input_shape,
         })
     }
@@ -73,11 +104,6 @@ impl OpenVinoSession {
 
     /// Run inference and return (shape_dims, data) for each output.
     pub fn run(&mut self, input: Array4<f32>) -> Result<Vec<(Vec<i64>, Vec<f32>)>> {
-        let mut infer_request = self
-            .compiled
-            .create_infer_request()
-            .context("Failed to create OpenVINO infer request")?;
-
         let shape_dims: Vec<i64> = input.shape().iter().map(|&d| d as i64).collect();
         let ov_shape = Shape::new(&shape_dims).context("Failed to create OpenVINO shape")?;
         let mut tensor =
@@ -90,16 +116,15 @@ impl OpenVinoSession {
             data.copy_from_slice(slice);
         }
 
-        infer_request
+        self.request
             .set_tensor(&self.input_name, &tensor)
             .context("Failed to set input tensor")?;
-        infer_request
-            .infer()
-            .context("OpenVINO inference failed")?;
+        self.request.infer().context("OpenVINO inference failed")?;
 
         let mut outputs = Vec::with_capacity(self.output_count);
         for idx in 0..self.output_count {
-            let tensor = infer_request
+            let tensor = self
+                .request
                 .get_output_tensor_by_index(idx)
                 .with_context(|| format!("Failed to get output tensor {}", idx))?;
             let shape = tensor
@@ -113,5 +138,72 @@ impl OpenVinoSession {
             outputs.push((dims, data));
         }
         Ok(outputs)
+    }
+}
+
+/// Map the configured device to one OpenVINO can use, plus AUTO priorities.
+///
+/// `AUTO` with an accelerator present lets OpenVINO run the first inferences on
+/// CPU while the NPU/GPU compile finishes — the main cost for a PAM helper that
+/// starts fresh on every `sudo`. Without accelerators plain `CPU` avoids the
+/// AUTO overhead. An explicitly requested but missing device falls back to CPU.
+pub fn choose_device(wanted: &str, available: &[String]) -> (String, Option<String>) {
+    let has = |prefix: &str| available.iter().any(|d| d.starts_with(prefix));
+    match wanted.trim().to_ascii_uppercase().as_str() {
+        "AUTO" | "" => {
+            let prio: Vec<&str> = ["NPU", "GPU"].into_iter().filter(|d| has(d)).collect();
+            if prio.is_empty() {
+                ("CPU".to_string(), None)
+            } else {
+                let mut p = prio.join(",");
+                p.push_str(",CPU");
+                ("AUTO".to_string(), Some(p))
+            }
+        }
+        dev @ ("NPU" | "GPU" | "CPU") if has(dev) => (dev.to_string(), None),
+        other => {
+            warn!("OpenVINO device {other:?} not available ({available:?}); using CPU");
+            ("CPU".to_string(), None)
+        }
+    }
+}
+
+/// `preferred` if it can be created and written, else the user cache dir, else none.
+fn writable_cache_dir(preferred: &str) -> Option<PathBuf> {
+    let candidates = [
+        (!preferred.trim().is_empty()).then(|| PathBuf::from(preferred)),
+        dirs::cache_dir().map(|d| d.join("faceauth").join("openvino")),
+    ];
+    candidates.into_iter().flatten().find(|dir| {
+        std::fs::create_dir_all(dir).is_ok() && {
+            let probe = dir.join(".write-test");
+            let ok = std::fs::write(&probe, b"").is_ok();
+            let _ = std::fs::remove_file(&probe);
+            ok
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_device;
+
+    fn devs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn auto_prefers_accelerators() {
+        assert_eq!(
+            choose_device("AUTO", &devs(&["CPU", "GPU.0", "NPU"])),
+            ("AUTO".into(), Some("NPU,GPU,CPU".into()))
+        );
+        assert_eq!(choose_device("auto", &devs(&["CPU"])), ("CPU".into(), None));
+        assert_eq!(
+            choose_device("NPU", &devs(&["CPU", "NPU"])),
+            ("NPU".into(), None)
+        );
+        assert_eq!(choose_device("NPU", &devs(&["CPU"])), ("CPU".into(), None));
+        assert_eq!(choose_device("TPU", &devs(&["CPU"])), ("CPU".into(), None));
     }
 }

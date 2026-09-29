@@ -1,13 +1,13 @@
 [package]
 name = "faceauth"
-version = "0.2.6"
+version = "0.3.0"
 edition = "2024"
 description = "Face authentication system for Linux using OpenVINO/ONNX"
 license = "MIT"
 authors = ["Vlad Wild <ya.vlash1@yandex.ru>"]
 
 [dependencies]
-opencv = { version = "0.98.2", default-features = false, features = ["clang-runtime", "imgproc", "videoio", "objdetect"] }
+opencv = { version = "0.101", default-features = false, features = ["clang-runtime", "imgproc", "videoio", "objdetect", "xobjdetect"] }
 ndarray = "0.16"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -15,18 +15,11 @@ toml = "0.8"
 clap = { version = "4.0", features = ["derive"] }
 anyhow = "1.0"
 log = "0.4"
-image = "0.25"
-walkdir = "2.5"
-config = "0.14"
 dirs = "5.0"
 libc = "0.2"
-nix = "0.28"
-pam = "0.7"
 chrono = { version = "0.4", features = ["serde"] }
-rand = "0.9"
+sha2 = "0.10"
 tract-onnx = "0.22"
-syslog = "6.1"
-lazy_static = "1.4"
 iced = { version = "0.14", features = ["image", "tokio"] }
 openvino = { version = "0.11", optional = true, features = ["runtime-linking"] }
 
@@ -43,7 +36,7 @@ path = "src/bin/auth.rs"
 
 [[bin]]
 name = "faceauth-ui"
-path = "src/bin/ui.rs"
+path = "src/bin/ui/main.rs"
 
 [profile.release]
 opt-level = 3

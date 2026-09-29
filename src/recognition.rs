@@ -1,41 +1,38 @@
 use anyhow::{Context, Result};
-use log::{info, warn};
+use log::info;
 use ndarray::Array4;
 use opencv::core::{AlgorithmHint, Mat, Point2f, Scalar, Size};
 use opencv::prelude::{MatTraitConst, MatTraitConstManual};
 use std::path::Path;
 use tract_onnx::prelude::*;
 
+use crate::config::{OpenVinoConfig, RecognitionConfig};
+use crate::matching::{file_fingerprint, l2_distance, l2_normalize};
+
 #[derive(Debug, Clone)]
 pub struct FaceEmbedding {
-    pub vector: Vec<f32>, // embedding vector
-    pub norm: f32,        // L2 norm for faster comparison
+    /// L2-normalized embedding vector.
+    pub vector: Vec<f32>,
 }
 
 impl FaceEmbedding {
     pub fn new(mut vector: Vec<f32>) -> Self {
-        let mut norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > f32::EPSILON {
-            for v in &mut vector {
-                *v /= norm;
-            }
-            norm = 1.0;
-        }
-        Self { vector, norm }
+        l2_normalize(&mut vector);
+        Self { vector }
     }
 
-    /// Cosine similarity between two embeddings
+    /// Cosine similarity (vectors are unit length, so this is the dot product).
     pub fn cosine_similarity(&self, other: &Self) -> f32 {
-        let dot: f32 = self.vector.iter().zip(&other.vector).map(|(a, b)| a * b).sum();
-        dot / (self.norm * other.norm)
+        self.vector
+            .iter()
+            .zip(&other.vector)
+            .map(|(a, b)| a * b)
+            .sum()
     }
 
-    /// Euclidean distance
+    /// Euclidean distance; infinite for vectors of different length.
     pub fn euclidean_distance(&self, other: &Self) -> f32 {
-        self.vector.iter().zip(&other.vector)
-            .map(|(a, b)| (a - b).powi(2))
-            .sum::<f32>()
-            .sqrt()
+        l2_distance(&self.vector, &other.vector)
     }
 }
 
@@ -45,50 +42,49 @@ enum Backend {
     #[cfg(feature = "openvino")]
     OpenVino(crate::openvino_backend::OpenVinoSession),
     Onnx(OnnxModel),
-    Fallback,
 }
 
+/// Face embedding extractor. Fails closed: there is no substitute embedding when
+/// the model is missing or inference fails, because authentication must never
+/// compare vectors that did not come from the enrolled recognizer.
 pub struct FaceRecognizer {
     backend: Backend,
+    model_id: String,
 }
 
 impl FaceRecognizer {
-    /// Load model. If `use_openvino` is true and the feature is compiled in,
-    /// attempt OpenVINO first, then tract-onnx, then deterministic fallback.
-    /// If `use_openvino` is false, skip OpenVINO.
-    pub fn load(model_path: &str, use_openvino: bool) -> Result<Self> {
-        let _ = use_openvino;
+    pub fn from_config(rc: &RecognitionConfig, ov: &OpenVinoConfig) -> Result<Self> {
+        Self::load(&rc.model_path, rc.use_openvino, ov)
+    }
+
+    /// Load model. With `use_openvino` (and the feature compiled in) OpenVINO is
+    /// tried first; tract-onnx runs the same model on CPU otherwise.
+    pub fn load(model_path: &str, use_openvino: bool, ov: &OpenVinoConfig) -> Result<Self> {
         let path = Path::new(model_path);
         if !path.exists() {
-            warn!(
-                "Recognition model not found at {}, using deterministic fallback",
-                model_path
-            );
-            info!("Recognition loaded via deterministic fallback (CPU)");
-            return Ok(Self {
-                backend: Backend::Fallback,
-            });
+            anyhow::bail!("Recognition model not found: {model_path}");
         }
+        let model_id = file_fingerprint(path)?;
 
         #[cfg(feature = "openvino")]
         if use_openvino {
-            match crate::openvino_backend::OpenVinoSession::from_onnx(model_path) {
+            match crate::openvino_backend::OpenVinoSession::from_onnx(model_path, ov) {
                 Ok(session) => {
-                    info!(
-                        "Recognition loaded via OpenVINO on {}",
-                        session.device()
-                    );
+                    info!("Recognition loaded via OpenVINO on {}", session.device());
                     return Ok(Self {
                         backend: Backend::OpenVino(session),
+                        model_id,
                     });
                 }
                 Err(e) => {
-                    warn!("OpenVINO backend init failed: {e}. Trying tract-onnx fallback");
+                    log::warn!("OpenVINO backend init failed: {e}. Trying tract-onnx");
                 }
             }
         }
+        #[cfg(not(feature = "openvino"))]
+        let _ = (use_openvino, ov);
 
-        match tract_onnx::onnx()
+        let model = tract_onnx::onnx()
             .model_for_path(path)
             .context("Failed to read ONNX model")?
             .with_input_fact(0, f32::fact([1, 3, 112, 112]).into())
@@ -96,22 +92,17 @@ impl FaceRecognizer {
             .into_optimized()
             .context("Failed to optimize ONNX model")?
             .into_runnable()
-            .context("Failed to create ONNX runnable model")
-        {
-            Ok(model) => {
-                info!("Recognition loaded via tract-onnx (CPU)");
-                Ok(Self {
-                    backend: Backend::Onnx(model),
-                })
-            },
-            Err(e) => {
-                warn!("tract-onnx backend init failed: {e}. Using deterministic fallback");
-                info!("Recognition loaded via deterministic fallback (CPU)");
-                Ok(Self {
-                    backend: Backend::Fallback,
-                })
-            }
-        }
+            .context("Failed to create ONNX runnable model")?;
+        info!("Recognition loaded via tract-onnx (CPU)");
+        Ok(Self {
+            backend: Backend::Onnx(model),
+            model_id,
+        })
+    }
+
+    /// Fingerprint of the loaded ONNX file (see [`file_fingerprint`]).
+    pub fn model_id(&self) -> &str {
+        &self.model_id
     }
 
     pub fn backend_info(&self) -> String {
@@ -119,33 +110,16 @@ impl FaceRecognizer {
             #[cfg(feature = "openvino")]
             Backend::OpenVino(session) => format!("OpenVINO ({})", session.device()),
             Backend::Onnx(_) => "tract-onnx (CPU)".to_string(),
-            Backend::Fallback => "deterministic fallback (CPU)".to_string(),
         }
     }
 
-    /// Extract embedding from a face crop, using best available backend.
+    /// Extract an embedding from an aligned / cropped face.
     pub fn extract(&mut self, face_image: &opencv::core::Mat) -> Result<FaceEmbedding> {
-        #[cfg(feature = "openvino")]
-        if let Backend::OpenVino(session) = &mut self.backend {
-            return match extract_openvino_embedding(session, face_image) {
-                Ok(emb) => Ok(emb),
-                Err(e) => {
-                    warn!("OpenVINO inference failed, falling back: {e}");
-                    extract_fallback_embedding(face_image)
-                }
-            };
+        match &mut self.backend {
+            #[cfg(feature = "openvino")]
+            Backend::OpenVino(session) => extract_openvino_embedding(session, face_image),
+            Backend::Onnx(model) => extract_onnx_embedding(model, face_image),
         }
-
-        if let Backend::Onnx(model) = &self.backend {
-            match extract_onnx_embedding(model, face_image) {
-                Ok(embedding) => return Ok(embedding),
-                Err(e) => {
-                    warn!("ONNX inference failed, using deterministic fallback: {e}");
-                }
-            }
-        }
-
-        extract_fallback_embedding(face_image)
     }
 }
 
@@ -166,14 +140,15 @@ fn extract_openvino_embedding(
     Ok(FaceEmbedding::new(data))
 }
 
-fn extract_onnx_embedding(model: &OnnxModel, face_image: &opencv::core::Mat) -> Result<FaceEmbedding> {
+fn extract_onnx_embedding(
+    model: &OnnxModel,
+    face_image: &opencv::core::Mat,
+) -> Result<FaceEmbedding> {
     let input = preprocess_for_mobilefacenet(face_image)?;
     let outputs = model
         .run(tvec!(input.into_tensor().into()))
         .context("ONNX run failed")?;
-    let output = outputs
-        .first()
-        .context("ONNX model returned no outputs")?;
+    let output = outputs.first().context("ONNX model returned no outputs")?;
     let view = output
         .to_array_view::<f32>()
         .context("ONNX output is not f32 tensor")?;
@@ -228,52 +203,6 @@ fn preprocess_for_mobilefacenet(face_image: &opencv::core::Mat) -> Result<Array4
     Ok(input)
 }
 
-/// Deterministic fallback embedding extractor.
-fn extract_fallback_embedding(face_image: &opencv::core::Mat) -> Result<FaceEmbedding> {
-        let mut gray = Mat::default();
-        opencv::imgproc::cvt_color(
-            face_image,
-            &mut gray,
-            opencv::imgproc::COLOR_BGR2GRAY,
-            0,
-            AlgorithmHint::ALGO_HINT_DEFAULT,
-        )?;
-
-        let mut resized = Mat::default();
-        opencv::imgproc::resize(
-            &gray,
-            &mut resized,
-            Size::new(16, 8),
-            0.0,
-            0.0,
-            opencv::imgproc::INTER_AREA,
-        )?;
-
-        let pixels = resized.data_typed::<u8>()?;
-        let mut vec = Vec::with_capacity(128);
-        for &p in pixels.iter().take(128) {
-            vec.push((p as f32 / 255.0) - 0.5);
-        }
-        while vec.len() < 128 {
-            vec.push(0.0);
-        }
-
-        // Zero-center to reduce sensitivity to global illumination changes.
-        let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-        for v in &mut vec {
-            *v -= mean;
-        }
-
-        let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > f32::EPSILON {
-            for v in &mut vec {
-                *v /= norm;
-            }
-        }
-
-        Ok(FaceEmbedding::new(vec))
-}
-
 /// Align a face using landmarks from YuNet (or any 5-point detector).
 ///
 /// **5 landmarks** — computes a full least-squares affine transform (6 DOF) that
@@ -289,11 +218,7 @@ fn extract_fallback_embedding(face_image: &opencv::core::Mat) -> Result<FaceEmbe
 /// `output_size` — width/height of the output square (e.g. 112 for MobileFaceNet).
 ///
 /// Returns an `output_size × output_size` aligned BGR face.
-pub fn align_face(
-    image: &Mat,
-    landmarks: &[Point2f],
-    output_size: i32,
-) -> Result<Mat> {
+pub fn align_face(image: &Mat, landmarks: &[Point2f], output_size: i32) -> Result<Mat> {
     if landmarks.len() < 2 {
         anyhow::bail!("Need at least 2 eye landmarks for alignment");
     }
@@ -306,11 +231,11 @@ pub fn align_face(
         // — Full 5-point least-squares affine (6 DOF) —
         // Canonical InsightFace positions in 112×112 output:
         let dst = [
-            Point2f::new((38.2946 * scale) as f32, (51.6963 * scale) as f32),  // YuNet[0]
-            Point2f::new((73.5318 * scale) as f32, (51.5014 * scale) as f32),  // YuNet[1]
-            Point2f::new((56.0252 * scale) as f32, (71.7366 * scale) as f32),  // YuNet[2]
-            Point2f::new((41.5493 * scale) as f32, (92.3655 * scale) as f32),  // YuNet[3]
-            Point2f::new((70.7299 * scale) as f32, (92.2041 * scale) as f32),  // YuNet[4]
+            Point2f::new((38.2946 * scale) as f32, (51.6963 * scale) as f32), // YuNet[0]
+            Point2f::new((73.5318 * scale) as f32, (51.5014 * scale) as f32), // YuNet[1]
+            Point2f::new((56.0252 * scale) as f32, (71.7366 * scale) as f32), // YuNet[2]
+            Point2f::new((41.5493 * scale) as f32, (92.3655 * scale) as f32), // YuNet[3]
+            Point2f::new((70.7299 * scale) as f32, (92.2041 * scale) as f32), // YuNet[4]
         ];
         compute_affine_5pt(&landmarks[..5], &dst)?
     } else {
@@ -347,13 +272,28 @@ pub fn align_face(
     let affine_mat = affine_mat.reshape(1, 2)?;
 
     let mut aligned = Mat::default();
+    let size = Size::new(output_size, output_size);
+    let (flags, border) = (opencv::imgproc::INTER_LINEAR, opencv::core::BORDER_CONSTANT);
+    // OpenCV 5 added an AlgorithmHint argument.
+    #[cfg(opencv5)]
     opencv::imgproc::warp_affine(
         image,
         &mut aligned,
         &affine_mat,
-        Size::new(output_size, output_size),
-        opencv::imgproc::INTER_LINEAR,
-        opencv::core::BORDER_CONSTANT,
+        size,
+        flags,
+        border,
+        Scalar::all(0.0),
+        AlgorithmHint::ALGO_HINT_DEFAULT,
+    )?;
+    #[cfg(not(opencv5))]
+    opencv::imgproc::warp_affine(
+        image,
+        &mut aligned,
+        &affine_mat,
+        size,
+        flags,
+        border,
         Scalar::all(0.0),
     )?;
 
@@ -451,4 +391,62 @@ fn solve_6x6(a: [[f64; 6]; 6], b: [f64; 6]) -> Result<[f64; 6]> {
     }
 
     Ok(x)
+}
+
+/// InsightFace canonical landmark positions in a 112×112 crop
+/// (right eye, left eye, nose, right mouth corner, left mouth corner).
+pub const CANONICAL_LANDMARKS_112: [(f32, f32); 5] = [
+    (38.2946, 51.6963),
+    (73.5318, 51.5014),
+    (56.0252, 71.7366),
+    (41.5493, 92.3655),
+    (70.7299, 92.2041),
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn canonical() -> Vec<Point2f> {
+        CANONICAL_LANDMARKS_112
+            .iter()
+            .map(|&(x, y)| Point2f::new(x, y))
+            .collect()
+    }
+
+    #[test]
+    fn affine_recovers_known_transform() {
+        // x' = 0.8x - 0.1y + 5, y' = 0.2x + 1.1y - 3
+        let src = canonical();
+        let dst: Vec<Point2f> = src
+            .iter()
+            .map(|p| Point2f::new(0.8 * p.x - 0.1 * p.y + 5.0, 0.2 * p.x + 1.1 * p.y - 3.0))
+            .collect();
+        let a = compute_affine_5pt(&src, &dst).unwrap();
+        let expected = [0.8, -0.1, 5.0, 0.2, 1.1, -3.0];
+        for (got, want) in a.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-3, "{a:?}");
+        }
+    }
+
+    #[test]
+    fn canonical_points_give_identity() {
+        let src = canonical();
+        let a = compute_affine_5pt(&src, &src).unwrap();
+        let expected = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        for (got, want) in a.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-4, "{a:?}");
+        }
+    }
+
+    #[test]
+    fn embedding_is_normalized() {
+        let e = FaceEmbedding::new(vec![3.0, 4.0]);
+        assert!((e.vector[0] - 0.6).abs() < 1e-6);
+        assert!((e.cosine_similarity(&e) - 1.0).abs() < 1e-6);
+        assert_eq!(
+            e.euclidean_distance(&FaceEmbedding::new(vec![1.0])),
+            f32::INFINITY
+        );
+    }
 }

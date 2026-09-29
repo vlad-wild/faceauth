@@ -1,10 +1,7 @@
 use anyhow::Result;
-use opencv::{
-    prelude::*,
-    videoio,
-    core,
-    imgproc,
-};
+
+pub use crate::devices::{VideoDevice, list_devices, parse_v4l2_device_index};
+use opencv::{core, imgproc, prelude::*, videoio};
 
 /// Camera capture abstraction
 pub struct Camera {
@@ -90,7 +87,11 @@ impl Camera {
         match self.rotate {
             1 => {
                 // Rotate 90 degrees counter-clockwise
-                opencv::core::rotate(&frame, &mut rotated, opencv::core::ROTATE_90_COUNTERCLOCKWISE)?;
+                opencv::core::rotate(
+                    &frame,
+                    &mut rotated,
+                    opencv::core::ROTATE_90_COUNTERCLOCKWISE,
+                )?;
                 Ok(rotated)
             }
             2 => {
@@ -130,17 +131,23 @@ impl Camera {
     }
 
     /// Get camera properties
-    pub fn width(&self) -> i32 { self.width }
-    pub fn height(&self) -> i32 { self.height }
-}
-
-fn parse_v4l2_device_index(device: &str) -> Option<i32> {
-    let prefix = "/dev/video";
-    if !device.starts_with(prefix) {
-        return None;
+    pub fn width(&self) -> i32 {
+        self.width
     }
-    let suffix = &device[prefix.len()..];
-    suffix.parse::<i32>().ok()
+    pub fn height(&self) -> i32 {
+        self.height
+    }
+
+    /// Open `device` and apply exposure from the config.
+    pub fn open_configured(device: &str, video: &crate::config::VideoConfig) -> Result<Self> {
+        let mut cam = Self::open(device, video.max_height, video.rotate)?;
+        if video.exposure >= 0
+            && let Err(e) = cam.set_exposure(video.exposure as f64)
+        {
+            log::warn!("Could not set exposure {}: {e}", video.exposure);
+        }
+        Ok(cam)
+    }
 }
 
 /// Calculate darkness of a grayscale frame (percentage of pixels near black)
@@ -148,4 +155,37 @@ pub fn darkness(frame: &Mat) -> Result<f64> {
     let mean = core::mean(frame, &Mat::default())?;
     let brightness = mean.0[0].clamp(0.0, 255.0);
     Ok(100.0 - (brightness / 255.0 * 100.0))
+}
+
+/// Mean and standard deviation of a grayscale region (clipped to the frame).
+pub fn roi_stats(gray: &Mat, rect: core::Rect) -> Result<(f64, f64)> {
+    let rect = crate::detection::clip_rect(rect, gray.cols(), gray.rows())
+        .ok_or_else(|| anyhow::anyhow!("Region lies outside the frame"))?;
+    let roi = gray.roi(rect)?.try_clone()?;
+    let mut mean = Mat::default();
+    let mut stddev = Mat::default();
+    core::mean_std_dev(&roi, &mut mean, &mut stddev, &Mat::default())?;
+    Ok((*mean.at::<f64>(0)?, *stddev.at::<f64>(0)?))
+}
+
+/// Variance of the Laplacian over a grayscale region: low values mean blur.
+pub fn sharpness(gray: &Mat, rect: core::Rect) -> Result<f64> {
+    let rect = crate::detection::clip_rect(rect, gray.cols(), gray.rows())
+        .ok_or_else(|| anyhow::anyhow!("Region lies outside the frame"))?;
+    let roi = gray.roi(rect)?.try_clone()?;
+    let mut lap = Mat::default();
+    imgproc::laplacian(
+        &roi,
+        &mut lap,
+        core::CV_64F,
+        3,
+        1.0,
+        0.0,
+        core::BORDER_DEFAULT,
+    )?;
+    let mut mean = Mat::default();
+    let mut stddev = Mat::default();
+    core::mean_std_dev(&lap, &mut mean, &mut stddev, &Mat::default())?;
+    let sd = *stddev.at::<f64>(0)?;
+    Ok(sd * sd)
 }
