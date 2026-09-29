@@ -1,8 +1,8 @@
+use chrono::Local;
+use log::{Level, LevelFilter, Metadata, Record};
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::sync::Mutex;
-use chrono::Local;
-use log::{Level, LevelFilter, Metadata, Record};
 
 /// Dual-output logger: console (with colors) + file (plain text).
 pub struct FaceAuthLogger {
@@ -14,12 +14,10 @@ pub struct FaceAuthLogger {
 impl FaceAuthLogger {
     pub fn new(log_file_path: Option<&str>, max_level: LevelFilter, use_colors: bool) -> Self {
         let file = if let Some(path) = log_file_path {
-            match OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
+            match OpenOptions::new().create(true).append(true).open(path) {
                 Ok(file) => Mutex::new(Some(file)),
+                // Unprivileged CLI / GUI runs cannot write the system log; console only.
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Mutex::new(None),
                 Err(e) => {
                     eprintln!("[logger] Failed to open log file {}: {}", path, e);
                     Mutex::new(None)
@@ -46,8 +44,8 @@ impl FaceAuthLogger {
         if self.use_colors {
             let level_color = match level {
                 Level::Error => "\x1b[31m", // red
-                Level::Warn  => "\x1b[33m", // yellow
-                Level::Info  => "\x1b[32m", // green
+                Level::Warn => "\x1b[33m",  // yellow
+                Level::Info => "\x1b[32m",  // green
                 Level::Debug => "\x1b[36m", // cyan
                 Level::Trace => "\x1b[35m", // magenta
             };
@@ -57,10 +55,7 @@ impl FaceAuthLogger {
                 timestamp, level_color, level, reset, target, args
             )
         } else {
-            format!(
-                "[{}] [{}] [{}] {}\n",
-                timestamp, level, target, args
-            )
+            format!("[{}] [{}] [{}] {}\n", timestamp, level, target, args)
         }
     }
 
@@ -77,11 +72,11 @@ impl FaceAuthLogger {
     }
 
     fn write_file(&self, line: &str) {
-        if let Ok(mut guard) = self.file.lock() {
-            if let Some(file) = guard.as_mut() {
-                let _ = file.write_all(line.as_bytes());
-                let _ = file.flush();
-            }
+        if let Ok(mut guard) = self.file.lock()
+            && let Some(file) = guard.as_mut()
+        {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.flush();
         }
     }
 }
@@ -111,10 +106,10 @@ impl log::Log for FaceAuthLogger {
     }
 
     fn flush(&self) {
-        if let Ok(mut guard) = self.file.lock() {
-            if let Some(file) = guard.as_mut() {
-                let _ = file.flush();
-            }
+        if let Ok(mut guard) = self.file.lock()
+            && let Some(file) = guard.as_mut()
+        {
+            let _ = file.flush();
         }
     }
 }
@@ -127,12 +122,12 @@ static LOGGER_INIT: std::sync::Once = std::sync::Once::new();
 
 fn parse_level(s: &str) -> LevelFilter {
     match s.to_ascii_lowercase().as_str() {
-        "error" | "err"     => LevelFilter::Error,
-        "warn" | "warning"  => LevelFilter::Warn,
-        "info"              => LevelFilter::Info,
-        "debug"             => LevelFilter::Debug,
-        "trace"             => LevelFilter::Trace,
-        _                   => LevelFilter::Info,
+        "error" | "err" => LevelFilter::Error,
+        "warn" | "warning" => LevelFilter::Warn,
+        "info" => LevelFilter::Info,
+        "debug" => LevelFilter::Debug,
+        "trace" => LevelFilter::Trace,
+        _ => LevelFilter::Info,
     }
 }
 
