@@ -109,7 +109,11 @@ fn run_via_daemon(user: &str) -> i32 {
             return EXIT_SETUP_ERROR;
         }
     }
-    match daemon::verify(Path::new(SOCKET_PATH), |_| {}) {
+    match daemon::verify(
+        Path::new(SOCKET_PATH),
+        env::var("PAM_SERVICE").ok().as_deref(),
+        |_| {},
+    ) {
         Ok((outcome, reason)) => {
             log::info!(
                 "faceauthd result for {user}: {outcome:?}{}",

@@ -10,6 +10,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::ops::ControlFlow;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -20,12 +21,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use faceauth::authenticate::{AuthOutcome, authenticate};
+use faceauth::calibration;
 use faceauth::config::{Config, SYSTEM_CONFIG_PATH};
-use faceauth::daemon::{Event, Outcome, RateLimiter, Request, SOCKET_PATH, peer_uid};
-use faceauth::gate::{Gate, pre_auth_checks};
+use faceauth::daemon::{
+    DaemonStatus, Event, HISTORY_LEN, HistoryEntry, MAX_PASSWORD_ONLY_SECS, Outcome,
+    PASSWORD_ONLY_DIR, RateLimiter, Request, SOCKET_PATH, peer_uid, sanitize_service,
+};
+use faceauth::database::{DISABLED_FLAG, load_user_model};
+use faceauth::gate::{Gate, password_only_until, pre_auth_checks, unix_now};
 use faceauth::logger;
 use faceauth::pipeline::{FaceVerdict, Models, Pipeline};
-use faceauth::privilege::{is_root, username_for_uid, validate_username};
+use faceauth::privilege::{is_root, lookup_user, username_for_uid, validate_username};
+use faceauth::session;
 
 /// Failed attempts allowed per uid within [`FAILURE_WINDOW`].
 const MAX_FAILURES: usize = 5;
@@ -59,6 +66,8 @@ struct Shared {
     limiter: Mutex<RateLimiter>,
     active: AtomicUsize,
     last_activity: Mutex<Instant>,
+    /// Recent attempts per uid (memory only).
+    history: Mutex<HashMap<u32, VecDeque<HistoryEntry>>>,
 }
 
 fn main() {
@@ -88,6 +97,7 @@ fn run(args: Args) -> Result<()> {
         limiter: Mutex::new(RateLimiter::new(MAX_FAILURES, FAILURE_WINDOW)),
         active: AtomicUsize::new(0),
         last_activity: Mutex::new(Instant::now()),
+        history: Mutex::new(HashMap::new()),
     });
     let idle = Duration::from_secs(args.idle_timeout);
 
@@ -181,83 +191,132 @@ fn handle(stream: UnixStream, shared: &Shared) -> Result<()> {
 
     let mut line = String::new();
     reader.read_line(&mut line).context("Reading request")?;
-    let request: Request = match serde_json::from_str(line.trim()) {
-        Ok(r) => r,
-        Err(_) => {
-            send(
-                &mut writer,
-                &Event::result(Outcome::Error, Some("bad_request")),
-            )?;
-            return Ok(());
-        }
+    let Ok(request) = serde_json::from_str::<Request>(line.trim()) else {
+        send(
+            &mut writer,
+            &Event::result(Outcome::Error, Some("bad_request")),
+        )?;
+        return Ok(());
     };
-    let requested_user = match request {
-        Request::Verify { user } => user,
-        Request::Cancel => {
-            send(
-                &mut writer,
-                &Event::result(Outcome::Error, Some("nothing_to_cancel")),
-            )?;
-            return Ok(());
-        }
-    };
-
-    // Non-root callers are always verified as themselves.
     let own_name = username_for_uid(uid)?;
-    let user = match requested_user {
-        Some(name) if uid == 0 => {
-            validate_username(&name)?;
-            name
+
+    let (outcome, reason) = match request {
+        Request::Verify { user, service } => {
+            // Non-root callers are always verified as themselves.
+            let user = match user {
+                Some(name) if uid == 0 => {
+                    validate_username(&name)?;
+                    name
+                }
+                Some(name) if name != own_name => {
+                    log::warn!("uid {uid} asked to verify {name}; refused");
+                    send(
+                        &mut writer,
+                        &Event::result(Outcome::Error, Some("not_allowed")),
+                    )?;
+                    return Ok(());
+                }
+                _ => own_name.clone(),
+            };
+            let service = sanitize_service(service.as_deref());
+            let (outcome, reason) = verify(shared, uid, &user, reader, &mut writer);
+            remember(shared, uid, &service, outcome, reason.as_deref());
+            log::info!(
+                "Result for {user} ({service}): {outcome:?}{}",
+                reason
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default()
+            );
+            (outcome, reason)
         }
-        Some(name) if name != own_name => {
-            log::warn!("uid {uid} asked to verify {name}; refused");
-            send(
-                &mut writer,
-                &Event::result(Outcome::Error, Some("not_allowed")),
-            )?;
-            return Ok(());
+        Request::Cancel => (Outcome::Error, Some("nothing_to_cancel".to_string())),
+        Request::Status => match status(shared, &own_name) {
+            Ok(st) => {
+                send(
+                    &mut writer,
+                    &Event::Status {
+                        status: Box::new(st),
+                    },
+                )?;
+                (Outcome::Success, None)
+            }
+            Err(e) => {
+                log::error!("Status for {own_name} failed: {e:#}");
+                (Outcome::Error, Some("setup_error".to_string()))
+            }
+        },
+        Request::History => {
+            let entries = shared
+                .history
+                .lock()
+                .unwrap()
+                .get(&uid)
+                .map(|h| h.iter().cloned().collect())
+                .unwrap_or_default();
+            send(&mut writer, &Event::History { entries })?;
+            (Outcome::Success, None)
         }
-        _ => own_name,
+        Request::PasswordOnly { seconds } => match set_password_only(uid, seconds) {
+            Ok(()) => (Outcome::Success, None),
+            Err(e) => {
+                log::error!("password_only for uid {uid} failed: {e:#}");
+                (Outcome::Error, Some("setup_error".to_string()))
+            }
+        },
+        Request::Calibrate { frames } => {
+            let frames = frames.unwrap_or(30).clamp(5, MAX_CALIBRATION_FRAMES);
+            calibrate(shared, &own_name, frames, reader, &mut writer)
+        }
     };
 
-    if !shared.limiter.lock().unwrap().allowed(uid, Instant::now()) {
-        send(
-            &mut writer,
-            &Event::result(Outcome::Busy, Some("rate_limited")),
-        )?;
-        return Ok(());
-    }
-    let Ok(mut engine) = shared.engine.try_lock() else {
-        send(
-            &mut writer,
-            &Event::result(Outcome::Busy, Some("attempt_in_progress")),
-        )?;
-        return Ok(());
-    };
+    let _ = send(&mut writer, &Event::result(outcome, reason.as_deref()));
+    // Unblocks the watcher thread even if the client keeps the socket open.
+    let _ = writer.shutdown(std::net::Shutdown::Both);
+    Ok(())
+}
 
-    // Watch the connection: "cancel" or a closed socket stops the attempt.
+/// Longest calibration a client may ask for.
+const MAX_CALIBRATION_FRAMES: usize = 100;
+
+/// Stop flag set when the client sends `cancel` or closes the connection.
+fn watch_for_cancel(mut reader: BufReader<UnixStream>) -> Arc<AtomicBool> {
     let cancel = Arc::new(AtomicBool::new(false));
-    {
-        let cancel = Arc::clone(&cancel);
-        let _ = reader.get_ref().set_read_timeout(None);
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        if matches!(serde_json::from_str(line.trim()), Ok(Request::Cancel)) {
-                            break;
-                        }
+    let flag = Arc::clone(&cancel);
+    let _ = reader.get_ref().set_read_timeout(None);
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if matches!(serde_json::from_str(line.trim()), Ok(Request::Cancel)) {
+                        break;
                     }
                 }
             }
-            cancel.store(true, Ordering::SeqCst);
-        });
-    }
+        }
+        flag.store(true, Ordering::SeqCst);
+    });
+    cancel
+}
 
-    let (outcome, reason) = match attempt(&mut engine, &user, &mut writer, &cancel) {
+fn verify(
+    shared: &Shared,
+    uid: u32,
+    user: &str,
+    reader: BufReader<UnixStream>,
+    writer: &mut UnixStream,
+) -> (Outcome, Option<String>) {
+    if !shared.limiter.lock().unwrap().allowed(uid, Instant::now()) {
+        return (Outcome::Busy, Some("rate_limited".to_string()));
+    }
+    let Ok(mut engine) = shared.engine.try_lock() else {
+        return (Outcome::Busy, Some("attempt_in_progress".to_string()));
+    };
+    let cancel = watch_for_cancel(reader);
+    let result = match attempt(&mut engine, user, writer, &cancel) {
         Ok(result) => result,
         Err(e) => {
             log::error!("Attempt for {user} failed: {e:#}");
@@ -269,18 +328,158 @@ fn handle(stream: UnixStream, shared: &Shared) -> Result<()> {
         .limiter
         .lock()
         .unwrap()
-        .record(uid, outcome, Instant::now());
-    log::info!(
-        "Result for {user}: {outcome:?}{}",
-        reason
-            .as_deref()
-            .map(|r| format!(" ({r})"))
-            .unwrap_or_default()
-    );
-    let _ = send(&mut writer, &Event::result(outcome, reason.as_deref()));
-    // Unblocks the watcher thread even if the client keeps the socket open.
-    let _ = writer.shutdown(std::net::Shutdown::Both);
+        .record(uid, result.0, Instant::now());
+    result
+}
+
+fn remember(shared: &Shared, uid: u32, service: &str, outcome: Outcome, reason: Option<&str>) {
+    let mut history = shared.history.lock().unwrap();
+    let list = history.entry(uid).or_default();
+    if list.len() == HISTORY_LEN {
+        list.pop_front();
+    }
+    list.push_back(HistoryEntry {
+        time: unix_now(),
+        service: service.to_string(),
+        outcome,
+        reason: reason.map(str::to_string),
+    });
+}
+
+fn load_system_config() -> Result<Config> {
+    Config::load_resolved(Path::new(SYSTEM_CONFIG_PATH))
+        .with_context(|| format!("Failed to load {SYSTEM_CONFIG_PATH}"))
+}
+
+fn camera_present(device: &str) -> bool {
+    !device.starts_with("/dev/") || Path::new(device).exists()
+}
+
+fn status(shared: &Shared, user: &str) -> Result<DaemonStatus> {
+    let cfg = load_system_config()?;
+    let uid = lookup_user(user)?.uid;
+    let backend = shared.engine.try_lock().ok().and_then(|e| {
+        e.models.as_ref().map(|m| {
+            format!(
+                "detector: {}, recognizer: {}",
+                m.detector.describe(),
+                m.recognizer.backend_info()
+            )
+        })
+    });
+    Ok(DaemonStatus {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        user: user.to_string(),
+        disabled: Path::new(DISABLED_FLAG).exists(),
+        lid_closed: session::lid_closed(),
+        password_only_until: password_only_until(Path::new(PASSWORD_ONLY_DIR), uid, unix_now()),
+        camera_device: cfg.video.device_path.clone(),
+        camera_present: camera_present(&cfg.video.device_path),
+        ir_mode: cfg.video.ir_mode,
+        backend,
+        model: load_user_model(user)?.map(|m| m.summary(user)),
+        threshold: cfg.recognition.distance_threshold,
+        required_matches: cfg.recognition.required_matches,
+    })
+}
+
+fn set_password_only(uid: u32, seconds: u64) -> Result<()> {
+    let dir = Path::new(PASSWORD_ONLY_DIR);
+    let path = dir.join(uid.to_string());
+    if seconds == 0 {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+    let until = unix_now() + seconds.min(MAX_PASSWORD_ONLY_SECS) as i64;
+    let tmp = dir.join(format!(".{uid}.tmp"));
+    std::fs::write(&tmp, format!("{until}\n"))?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
+    std::fs::rename(&tmp, &path)?;
+    log::info!("password_only for uid {uid} until {until}");
     Ok(())
+}
+
+/// Open the camera with cached models; on failure the models are kept.
+fn open_pipeline(engine: &mut Engine, cfg: &Config) -> Result<Pipeline> {
+    let stamp = config_stamp();
+    if engine.config_stamp != stamp {
+        engine.models = None;
+    }
+    let models = match engine.models.take() {
+        Some(models) => models,
+        None => Models::load(cfg)?,
+    };
+    engine.config_stamp = stamp;
+    match Pipeline::open_camera(cfg, &cfg.video.device_path) {
+        Ok(camera) => Ok(Pipeline::with_models(camera, models)),
+        Err(e) => {
+            engine.models = Some(models);
+            Err(e)
+        }
+    }
+}
+
+fn calibrate(
+    shared: &Shared,
+    user: &str,
+    frames: usize,
+    reader: BufReader<UnixStream>,
+    writer: &mut UnixStream,
+) -> (Outcome, Option<String>) {
+    let Ok(mut engine) = shared.engine.try_lock() else {
+        return (Outcome::Busy, Some("attempt_in_progress".to_string()));
+    };
+    let cancel = watch_for_cancel(reader);
+    let mut run = || -> Result<(Outcome, Option<String>)> {
+        let cfg = load_system_config()?;
+        let model = match pre_auth_checks(&cfg, user, false)? {
+            Gate::Proceed(model) => model,
+            Gate::Skip(reason) => return Ok((Outcome::Skipped, Some(reason.key().to_string()))),
+        };
+        if !camera_present(&cfg.video.device_path) {
+            return Ok((Outcome::Skipped, Some("camera_unavailable".to_string())));
+        }
+        let mut pipeline = open_pipeline(&mut engine, &cfg)?;
+        let result = calibration::calibrate(
+            &mut pipeline,
+            &cfg,
+            &model,
+            frames,
+            Duration::from_secs(60),
+            |p| {
+                let sent = match p {
+                    calibration::Progress::Scored { n, of } => {
+                        send(writer, &Event::CalibrationProgress { n, of }).is_ok()
+                    }
+                    calibration::Progress::Rejected(_) => true,
+                };
+                if !sent || cancel.load(Ordering::SeqCst) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        );
+        engine.models = Some(pipeline.into_models());
+        Ok(match result? {
+            Some(calibration) => {
+                send(writer, &Event::Calibration { calibration })?;
+                (Outcome::Success, None)
+            }
+            None if cancel.load(Ordering::SeqCst) => (Outcome::Cancelled, None),
+            None => (Outcome::NoMatch, Some("no_usable_frames".to_string())),
+        })
+    };
+    run().unwrap_or_else(|e| {
+        log::error!("Calibration for {user} failed: {e:#}");
+        (Outcome::Error, Some("setup_error".to_string()))
+    })
 }
 
 fn config_stamp() -> Option<SystemTime> {
@@ -296,8 +495,7 @@ fn attempt(
     writer: &mut UnixStream,
     cancel: &AtomicBool,
 ) -> Result<(Outcome, Option<String>)> {
-    let cfg = Config::load_resolved(Path::new(SYSTEM_CONFIG_PATH))
-        .with_context(|| format!("Failed to load {SYSTEM_CONFIG_PATH}"))?;
+    let cfg = load_system_config()?;
 
     let model = match pre_auth_checks(&cfg, user, false)? {
         Gate::Proceed(model) => model,
@@ -305,29 +503,10 @@ fn attempt(
     };
 
     // The camera key (or a privacy switch) removes the device: skip without waiting.
-    let device = &cfg.video.device_path;
-    if device.starts_with("/dev/") && !Path::new(device).exists() {
+    if !camera_present(&cfg.video.device_path) {
         return Ok((Outcome::Skipped, Some("camera_unavailable".to_string())));
     }
-
-    let stamp = config_stamp();
-    if engine.config_stamp != stamp {
-        engine.models = None;
-    }
-    let models = match engine.models.take() {
-        Some(models) => models,
-        None => Models::load(&cfg)?,
-    };
-    engine.config_stamp = stamp;
-
-    let camera = match Pipeline::open_camera(&cfg, device) {
-        Ok(camera) => camera,
-        Err(e) => {
-            engine.models = Some(models);
-            return Err(e);
-        }
-    };
-    let mut pipeline = Pipeline::with_models(camera, models);
+    let mut pipeline = open_pipeline(engine, &cfg)?;
     if send(writer, &Event::Started).is_err() {
         engine.models = Some(pipeline.into_models());
         return Ok((Outcome::Cancelled, Some("client_gone".to_string())));

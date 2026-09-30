@@ -12,6 +12,7 @@ ndarray = "0.16"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
+toml_edit = "0.22"
 clap = { version = "4.0", features = ["derive"] }
 anyhow = "1.0"
 log = "0.4"
@@ -33,6 +34,10 @@ tempfile = "3.10"
 [[bin]]
 name = "faceauth-auth"
 path = "src/bin/auth.rs"
+
+[[bin]]
+name = "faceauth-admin"
+path = "src/bin/admin.rs"
 
 [[bin]]
 name = "faceauthd"

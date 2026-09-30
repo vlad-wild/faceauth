@@ -178,7 +178,7 @@ impl FaceModel {
 }
 
 /// Metadata about a model without the vectors (`faceauth list --json`, GUI).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelSummary {
     pub user: String,
     pub label: String,
@@ -189,7 +189,7 @@ pub struct ModelSummary {
     pub model_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VariantSummary {
     pub label: String,
     pub samples: usize,

@@ -1,4 +1,5 @@
 pub mod authenticate;
+pub mod calibration;
 pub mod camera;
 pub mod config;
 pub mod daemon;
@@ -13,9 +14,11 @@ pub mod i18n;
 pub mod logger;
 pub mod matching;
 pub mod pipeline;
+pub mod preview;
 pub mod privilege;
 pub mod recognition;
 pub mod session;
+pub mod settings;
 pub mod verdict;
 
 #[cfg(feature = "openvino")]

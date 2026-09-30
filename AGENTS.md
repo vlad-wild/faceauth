@@ -6,6 +6,7 @@
 ## Architecture
 - **CLI** (`src/main.rs`) – `faceauth` binary: enroll, list/remove/rename, test, calibrate, migrate, doctor, and the `import`/`verify` helpers used by the GUI through `pkexec`.
 - **PAM helper** (`src/bin/auth.rs`) – `faceauth-auth`, run by `pam_exec`. As root it runs the pipeline itself; unprivileged (screen lockers) it asks `faceauthd` and only if `PAM_USER` is the calling user. Exit codes: 0 match, 10 skipped, 11 no match, 12 setup error, 13 too dark.
+- **Admin helper** (`src/bin/admin.rs`) – `faceauth-admin` in `/usr/lib/faceauth/`, run through `pkexec` under its own polkit action `org.faceauth.configure` (`auth_admin_keep`): `get`, `set <key> <value>` (allow-list in `settings.rs`), `disable`/`enable`. Kept separate from `faceauth` because polkit picks the action by executable path, and `pkexec faceauth` is `auth_self`.
 - **Daemon** (`src/bin/faceauthd.rs`) – `faceauthd`, root, socket-activated (`packaging/faceauthd.{socket,service}`). Verifies the caller's own face (uid from `SO_PEERCRED`), one attempt at a time, rate-limited, keeps `Models` loaded and opens the camera per attempt, exits when idle. Protocol and client in `daemon.rs`.
 - **GUI** (`src/bin/ui/main.rs` + `src/bin/ui/worker.rs`) – `faceauth-ui` (Iced 0.14). A single worker thread owns the camera and pipeline; all store access goes through `pkexec faceauth …`.
 
@@ -14,6 +15,9 @@
 |--------|---------|
 | `pipeline.rs` | `Pipeline` (camera + detector + recognizer), `analyze_frame` → `FrameAnalysis`/`FaceVerdict`, `select_face`, `face_crop`, IR liveness |
 | `authenticate.rs` | Shared auth loop (PAM helper, daemon, `faceauth test`): consecutive matches, top-k scoring, report; the frame callback returns `ControlFlow` (`Break` → `Cancelled`) |
+| `calibration.rs` | Own-face score collection and threshold suggestion (CLI `calibrate`, daemon `calibrate`) |
+| `settings.rs` | Allow-listed system settings (`KEYS`) and comment-preserving `set_in_toml` (toml_edit) for `faceauth-admin` |
+| `preview.rs` | Small grayscale PGM data-URL previews for JSON clients (`faceauth capture --preview`) |
 | `gate.rs` | `pre_auth_checks`: disabled flag, remote session, lid, enrolled model — run before the camera opens |
 | `daemon.rs` | `faceauthd` protocol (`Request`/`Event`/`Outcome`, JSON lines), `RateLimiter`, `peer_uid`, client `verify()` |
 | `enroll.rs` | Step-wise `EnrollSession` (quality gates, pose buckets, duplicates) and CLI `enroll_user` |

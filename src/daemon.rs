@@ -25,9 +25,82 @@ pub enum Request {
     Verify {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user: Option<String>,
+        /// Who is asking, for the attempt history (e.g. `lock`, a PAM service name).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service: Option<String>,
     },
     /// Stop the attempt in progress on this connection.
     Cancel,
+    /// Camera, backend and enrolled-model summary for the caller.
+    Status,
+    /// Score the caller's own face over `frames` frames and suggest a threshold.
+    Calibrate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frames: Option<usize>,
+    },
+    /// The caller's recent attempts (kept in memory only).
+    History,
+    /// Do not offer face authentication to the caller for `seconds` (max 600),
+    /// so the next polkit prompt asks for the password. `0` clears it.
+    PasswordOnly { seconds: u64 },
+}
+
+/// Longest `password_only` period a client may request.
+pub const MAX_PASSWORD_ONLY_SECS: u64 = 600;
+
+/// Directory of per-uid `password_only` flags (content: expiry, Unix seconds).
+pub const PASSWORD_ONLY_DIR: &str = "/run/faceauth/password-only";
+
+/// Attempts remembered per uid for `history`.
+pub const HISTORY_LEN: usize = 20;
+
+/// One remembered attempt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    /// Unix seconds.
+    pub time: i64,
+    pub service: String,
+    pub outcome: Outcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Answer to `status`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonStatus {
+    pub version: String,
+    pub user: String,
+    /// Face authentication disabled for everyone.
+    pub disabled: bool,
+    pub lid_closed: bool,
+    /// Unix seconds until which `password_only` is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_only_until: Option<i64>,
+    pub camera_device: String,
+    pub camera_present: bool,
+    pub ir_mode: bool,
+    /// Detector / recognizer backends, once the models have been loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<crate::database::ModelSummary>,
+    pub threshold: f64,
+    pub required_matches: u32,
+}
+
+/// Keep client-supplied service labels short and printable.
+pub fn sanitize_service(service: Option<&str>) -> String {
+    let cleaned: String = service
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(32)
+        .collect();
+    if cleaned.is_empty() {
+        "unknown".to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// How an attempt ended.
@@ -72,6 +145,16 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         score: Option<f32>,
         matched: bool,
+    },
+    /// Answer to `status`.
+    Status { status: Box<DaemonStatus> },
+    /// Answer to `history`, oldest first.
+    History { entries: Vec<HistoryEntry> },
+    /// `calibrate` progress.
+    CalibrationProgress { n: usize, of: usize },
+    /// `calibrate` result.
+    Calibration {
+        calibration: crate::calibration::Calibration,
     },
     /// Final event on every connection.
     Result {
@@ -173,6 +256,7 @@ pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Result<u32> {
 #[cfg(unix)]
 pub fn verify(
     socket: &Path,
+    service: Option<&str>,
     mut on_event: impl FnMut(&Event),
 ) -> Result<(Outcome, Option<String>)> {
     use std::io::{BufRead, BufReader, Write};
@@ -182,7 +266,10 @@ pub fn verify(
         .with_context(|| format!("Cannot connect to faceauthd at {}", socket.display()))?;
     // Longer than any configured timeout: the daemon always ends with a result.
     stream.set_read_timeout(Some(Duration::from_secs(90)))?;
-    let mut request = serde_json::to_string(&Request::Verify { user: None })?;
+    let mut request = serde_json::to_string(&Request::Verify {
+        user: None,
+        service: service.map(str::to_string),
+    })?;
     request.push('\n');
     stream.write_all(request.as_bytes())?;
 
@@ -208,14 +295,29 @@ mod tests {
     #[test]
     fn requests_parse() {
         let r: Request = serde_json::from_str(r#"{"op":"verify"}"#).unwrap();
-        assert_eq!(r, Request::Verify { user: None });
-        let r: Request = serde_json::from_str(r#"{"op":"verify","user":"vlad"}"#).unwrap();
         assert_eq!(
             r,
             Request::Verify {
-                user: Some("vlad".into())
+                user: None,
+                service: None
             }
         );
+        let r: Request =
+            serde_json::from_str(r#"{"op":"verify","user":"vlad","service":"lock"}"#).unwrap();
+        assert_eq!(
+            r,
+            Request::Verify {
+                user: Some("vlad".into()),
+                service: Some("lock".into())
+            }
+        );
+        let r: Request = serde_json::from_str(r#"{"op":"password_only","seconds":60}"#).unwrap();
+        assert_eq!(r, Request::PasswordOnly { seconds: 60 });
+        let r: Request = serde_json::from_str(r#"{"op":"calibrate"}"#).unwrap();
+        assert_eq!(r, Request::Calibrate { frames: None });
+        for op in ["status", "history"] {
+            assert!(serde_json::from_str::<Request>(&format!(r#"{{"op":"{op}"}}"#)).is_ok());
+        }
         let r: Request = serde_json::from_str(r#"{"op":"cancel"}"#).unwrap();
         assert_eq!(r, Request::Cancel);
         assert!(serde_json::from_str::<Request>(r#"{"op":"enroll"}"#).is_err());
@@ -241,6 +343,15 @@ mod tests {
         let back: Event =
             serde_json::from_str(r#"{"event":"result","outcome":"too_dark"}"#).unwrap();
         assert_eq!(back, Event::result(Outcome::TooDark, None));
+    }
+
+    #[test]
+    fn service_labels_are_sanitized() {
+        assert_eq!(sanitize_service(None), "unknown");
+        assert_eq!(sanitize_service(Some("sudo")), "sudo");
+        assert_eq!(sanitize_service(Some("qs-lock")), "qs-lock");
+        assert_eq!(sanitize_service(Some("a b{c}")), "abc");
+        assert_eq!(sanitize_service(Some(&"x".repeat(50))).len(), 32);
     }
 
     #[test]

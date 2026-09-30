@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use faceauth::{
     authenticate::{AuthOutcome, authenticate},
-    camera,
+    calibration, camera,
     config::Config,
     database::{
         DISABLED_FLAG, Database, EnrollMerge, Enrollment, ImportPayload, MODELS_DIR, ModelSummary,
@@ -18,13 +18,10 @@ use faceauth::{
     doctor,
     enroll::{self, EnrollEvent, EnrollParams},
     i18n::{t, tf},
-    matching::{file_fingerprint, score_stats},
-    pipeline::{AnalysisMode, Pipeline},
+    matching::file_fingerprint,
+    pipeline::Pipeline,
     privilege::{authorize_for_user, authorize_global, pkexec_caller},
 };
-
-/// `calibrate` never suggests a threshold below this (identical frames give p95 ≈ 0).
-const MIN_SUGGESTED_THRESHOLD: f32 = 0.3;
 
 /// Largest JSON payload accepted on stdin by `import` / `verify`.
 const MAX_STDIN_BYTES: u64 = 8 * 1024 * 1024;
@@ -82,6 +79,31 @@ enum Commands {
         /// Named appearance variant (e.g. glasses). Without `--append`, replaces that variant's samples.
         #[arg(long, value_name = "NAME")]
         variant: Option<String>,
+    },
+    /// Capture an enrollment as the desktop user and print JSON lines; the final
+    /// `payload` event is what `pkexec faceauth import` reads on stdin (no root needed)
+    Capture {
+        /// Number of samples to capture
+        #[arg(short, long, default_value = "9")]
+        samples: usize,
+        /// Camera device path or index (default: video.device_path)
+        #[arg(short, long)]
+        device: Option<String>,
+        /// IR / low-light mode (same as `ir_mode` in config)
+        #[arg(long)]
+        ir: bool,
+        /// Append to the model instead of replacing it
+        #[arg(long)]
+        append: bool,
+        /// Named appearance variant (e.g. glasses)
+        #[arg(long, value_name = "NAME")]
+        variant: Option<String>,
+        /// Label for the model or variant
+        #[arg(short, long)]
+        label: Option<String>,
+        /// Include small grayscale previews (PGM data URLs, ~5 fps) in frame events
+        #[arg(long)]
+        preview: bool,
     },
     /// List enrolled face models (root)
     List {
@@ -205,6 +227,21 @@ fn main() -> Result<()> {
             eprintln!();
             result
         }
+        Commands::Capture {
+            samples,
+            device,
+            ir,
+            append,
+            variant,
+            label,
+            preview,
+        } => {
+            let variant = variant
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            let merge = EnrollMerge::from_flags(variant.is_some(), append);
+            capture(cfg, samples, device, ir, merge, variant, label, preview)
+        }
         Commands::List { user, json } => list_models(user, json),
         Commands::Remove { user, variant } => remove(&user, variant.as_deref()),
         Commands::RenameVariant { user, from, to } => {
@@ -256,6 +293,105 @@ fn print_enroll_event(ev: &EnrollEvent) {
     };
     eprint!("\r\x1b[2K{line}");
     let _ = std::io::stderr().flush();
+}
+
+/// Print one JSON event line for `capture`.
+fn emit(value: serde_json::Value) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{value}")?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Unprivileged enrollment capture for other front ends (the embeddings never
+/// touch the disk: the caller pipes the `payload` event into `faceauth import`).
+#[allow(clippy::too_many_arguments)]
+fn capture(
+    mut cfg: Config,
+    samples: usize,
+    device: Option<String>,
+    ir: bool,
+    merge: EnrollMerge,
+    variant: Option<String>,
+    label: Option<String>,
+    preview: bool,
+) -> Result<()> {
+    if ir {
+        cfg.video.ir_mode = true;
+    }
+    let device = device.unwrap_or_else(|| cfg.video.device_path.clone());
+    let mut pipeline = match Pipeline::open(&cfg, &device) {
+        Ok(p) => p,
+        Err(e) => {
+            emit(serde_json::json!({
+                "event": "error",
+                "reason": "camera",
+                "detail": format!("{e:#}"),
+            }))?;
+            std::process::exit(1);
+        }
+    };
+    let model_id = pipeline.recognizer.model_id().to_string();
+    emit(serde_json::json!({
+        "event": "started",
+        "device": device,
+        "ir": cfg.video.ir_mode,
+        "backend": pipeline.describe(),
+        "samples": samples,
+    }))?;
+
+    let pause = Duration::from_millis(cfg.video.frame_interval_ms);
+    let preview_every = Duration::from_millis(200);
+    let mut last_preview: Option<Instant> = None;
+    let mut session = enroll::EnrollSession::new(samples, &cfg);
+    while !session.is_done() {
+        let step = match session.step(&mut pipeline, &cfg) {
+            Ok(step) => step,
+            Err(_) => {
+                std::thread::sleep(pause);
+                continue;
+            }
+        };
+        let mut frame = serde_json::json!({
+            "event": "frame",
+            "face": step.frame.analysis.face.is_some(),
+            "verdict": step.frame.analysis.verdict.key(),
+        });
+        if preview && last_preview.is_none_or(|t| t.elapsed() >= preview_every) {
+            last_preview = Some(Instant::now());
+            if let Ok(url) = faceauth::preview::gray_preview(&step.frame.gray) {
+                frame["preview"] = serde_json::Value::String(url);
+            }
+        }
+        emit(frame)?;
+        match step.event {
+            Some(EnrollEvent::Sample { cur, tot }) => {
+                emit(serde_json::json!({ "event": "sample", "n": cur, "of": tot }))?
+            }
+            Some(EnrollEvent::Hint(h)) => emit(serde_json::json!({
+                "event": "hint",
+                "hint": h.message_key().trim_start_matches("hint."),
+            }))?,
+            Some(EnrollEvent::Duplicate) => {
+                emit(serde_json::json!({ "event": "hint", "hint": "duplicate" }))?
+            }
+            Some(EnrollEvent::Rejected(_)) | None => {}
+        }
+    }
+
+    let embeddings = session.into_vectors();
+    if embeddings.is_empty() {
+        emit(serde_json::json!({ "event": "error", "reason": "no_samples" }))?;
+        std::process::exit(1);
+    }
+    let payload = ImportPayload {
+        merge,
+        variant,
+        label,
+        model_id,
+        embeddings,
+    };
+    emit(serde_json::json!({ "event": "payload", "payload": payload }))
 }
 
 fn test_camera(cfg: &Config, device: &str, frames: usize) -> Result<()> {
@@ -440,58 +576,52 @@ fn calibrate(cfg: &Config, user: &str, frames: usize) -> Result<()> {
         load_user_model(user)?.with_context(|| format!("No model enrolled for user {user}"))?;
     let mut pipeline = Pipeline::open(cfg, &cfg.video.device_path)?;
     let k = cfg.recognition.top_k;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut scores = Vec::with_capacity(frames);
-    let mut face_stats = Vec::new();
     eprintln!("Look at the camera as you normally would when logging in…");
-    while scores.len() < frames && Instant::now() < deadline {
-        let frame = match pipeline.capture(cfg, AnalysisMode::Auth) {
-            Ok(f) => f,
-            Err(_) => {
-                std::thread::sleep(Duration::from_millis(cfg.video.frame_interval_ms));
-                continue;
+    let result = calibration::calibrate(
+        &mut pipeline,
+        cfg,
+        &model,
+        frames,
+        Duration::from_secs(60),
+        |p| {
+            match p {
+                calibration::Progress::Scored { n, of } => eprint!("\r\x1b[2K{n}/{of}"),
+                calibration::Progress::Rejected(v) => {
+                    eprint!("\r\x1b[2K{}", t(v.message_key()))
+                }
             }
-        };
-        if let Some(face) = &frame.analysis.face
-            && let Ok(s) = camera::roi_stats(&frame.gray, face.bbox)
-        {
-            face_stats.push(s);
-        }
-        if let Some(emb) = pipeline.embed(&frame, cfg)? {
-            model.check_compatible(pipeline.recognizer.model_id(), emb.vector.len())?;
-            scores.push(model.match_score(&emb.vector, k));
-            eprint!("\r\x1b[2K{}/{frames}", scores.len());
-        } else {
-            eprint!("\r\x1b[2K{}", t(frame.analysis.verdict.message_key()));
-        }
-    }
+            ControlFlow::Continue(())
+        },
+    )?;
     eprintln!();
-    let Some((min, median, p95)) = score_stats(&scores) else {
+    let Some(c) = result else {
         bail!("No usable frames captured");
     };
-    let current = cfg.recognition.distance_threshold;
-    let suggested = p95 * 1.15;
-    println!("Frames scored: {}", scores.len());
-    println!("Score (top-{k}): min {min:.4}, median {median:.4}, p95 {p95:.4}");
-    if !face_stats.is_empty() {
-        let n = face_stats.len() as f64;
-        let mean = face_stats.iter().map(|s| s.0).sum::<f64>() / n;
-        let sd = face_stats.iter().map(|s| s.1).sum::<f64>() / n;
+    println!("Frames scored: {}", c.frames);
+    println!(
+        "Score (top-{k}): min {:.4}, median {:.4}, p95 {:.4}",
+        c.min, c.median, c.p95
+    );
+    if let Some((mean, sd)) = c.face_brightness {
         println!(
             "Face region brightness: mean {mean:.1}, stddev {sd:.1} (liveness thresholds: {:.1} / {:.1})",
             cfg.liveness.min_face_brightness, cfg.liveness.min_face_stddev
         );
     }
-    println!("Current distance_threshold: {current:.3}");
-    if suggested < MIN_SUGGESTED_THRESHOLD {
+    println!("Current distance_threshold: {:.3}", c.current);
+    if c.raw_suggestion < calibration::MIN_SUGGESTED_THRESHOLD {
         println!(
-            "Suggested distance_threshold: {MIN_SUGGESTED_THRESHOLD:.3} (frames were nearly identical; \
-             p95 × 1.15 = {suggested:.3} would reject normal variation)"
+            "Suggested distance_threshold: {:.3} (frames were nearly identical; \
+             p95 × 1.15 = {:.3} would reject normal variation)",
+            c.suggested, c.raw_suggestion
         );
     } else {
-        println!("Suggested distance_threshold: {suggested:.3} (p95 × 1.15)");
+        println!(
+            "Suggested distance_threshold: {:.3} (p95 × 1.15)",
+            c.suggested
+        );
     }
-    if suggested > 0.9 {
+    if c.raw_suggestion > 0.9 {
         println!(
             "⚠ Your own scores are high: re-enroll with more samples or check the camera/lighting before raising the threshold."
         );

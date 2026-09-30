@@ -51,6 +51,8 @@ package() {
   install -Dm755 "target/release/faceauth-auth" "$pkgdir/usr/bin/faceauth-auth"
   install -Dm755 "target/release/faceauth-ui" "$pkgdir/usr/bin/faceauth-ui"
   install -Dm755 "target/release/faceauthd" "$pkgdir/usr/bin/faceauthd"
+  # System settings for desktop front ends (pkexec, org.faceauth.configure)
+  install -Dm755 "target/release/faceauth-admin" "$pkgdir/usr/lib/faceauth/faceauth-admin"
 
   # faceauthd: face unlock for unprivileged screen lockers (socket activated)
   install -Dm644 "packaging/faceauthd.socket" "$pkgdir/usr/lib/systemd/system/faceauthd.socket"
