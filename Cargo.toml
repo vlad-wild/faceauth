@@ -35,6 +35,10 @@ name = "faceauth-auth"
 path = "src/bin/auth.rs"
 
 [[bin]]
+name = "faceauthd"
+path = "src/bin/faceauthd.rs"
+
+[[bin]]
 name = "faceauth-ui"
 path = "src/bin/ui/main.rs"
 

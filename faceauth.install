@@ -6,6 +6,8 @@ post_install() {
     sudo faceauth calibrate -u "$USER"   # tune distance_threshold
     Then add to the top of /etc/pam.d/sudo (see /usr/share/doc/faceauth/pam-example):
       auth sufficient pam_exec.so quiet /usr/bin/faceauth-auth
+    For face unlock in screen lockers (they run as your user, not root):
+      sudo systemctl enable --now faceauthd.socket
 MSG
 }
 

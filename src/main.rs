@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use log::info;
 use std::io::{Read, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -420,6 +421,7 @@ fn test_auth(mut cfg: Config, user: &str, timeout_override: Option<u32>, ir: boo
             None => t(ev.frame.analysis.verdict.message_key()).to_string(),
         };
         eprint!("\r\x1b[2K{line}");
+        ControlFlow::Continue(())
     })?;
     eprintln!();
     println!("{}", report.summary());

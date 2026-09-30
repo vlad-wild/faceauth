@@ -5,14 +5,17 @@
 
 ## Architecture
 - **CLI** (`src/main.rs`) – `faceauth` binary: enroll, list/remove/rename, test, calibrate, migrate, doctor, and the `import`/`verify` helpers used by the GUI through `pkexec`.
-- **PAM helper** (`src/bin/auth.rs`) – `faceauth-auth`, run as root by `pam_exec`. Exit codes: 0 match, 10 skipped, 11 no match, 12 setup error, 13 too dark.
+- **PAM helper** (`src/bin/auth.rs`) – `faceauth-auth`, run by `pam_exec`. As root it runs the pipeline itself; unprivileged (screen lockers) it asks `faceauthd` and only if `PAM_USER` is the calling user. Exit codes: 0 match, 10 skipped, 11 no match, 12 setup error, 13 too dark.
+- **Daemon** (`src/bin/faceauthd.rs`) – `faceauthd`, root, socket-activated (`packaging/faceauthd.{socket,service}`). Verifies the caller's own face (uid from `SO_PEERCRED`), one attempt at a time, rate-limited, keeps `Models` loaded and opens the camera per attempt, exits when idle. Protocol and client in `daemon.rs`.
 - **GUI** (`src/bin/ui/main.rs` + `src/bin/ui/worker.rs`) – `faceauth-ui` (Iced 0.14). A single worker thread owns the camera and pipeline; all store access goes through `pkexec faceauth …`.
 
 ### Key modules
 | Module | Purpose |
 |--------|---------|
 | `pipeline.rs` | `Pipeline` (camera + detector + recognizer), `analyze_frame` → `FrameAnalysis`/`FaceVerdict`, `select_face`, `face_crop`, IR liveness |
-| `authenticate.rs` | Shared auth loop (PAM helper and `faceauth test`): consecutive matches, top-k scoring, report |
+| `authenticate.rs` | Shared auth loop (PAM helper, daemon, `faceauth test`): consecutive matches, top-k scoring, report; the frame callback returns `ControlFlow` (`Break` → `Cancelled`) |
+| `gate.rs` | `pre_auth_checks`: disabled flag, remote session, lid, enrolled model — run before the camera opens |
+| `daemon.rs` | `faceauthd` protocol (`Request`/`Event`/`Outcome`, JSON lines), `RateLimiter`, `peer_uid`, client `verify()` |
 | `enroll.rs` | Step-wise `EnrollSession` (quality gates, pose buckets, duplicates) and CLI `enroll_user` |
 | `matching.rs` | `l2_distance`, `set_score` (top-k), `MatchTracker`, `PoseCollector`, `score_stats`, `file_fingerprint` (SHA-256 of the ONNX) — no OpenCV |
 | `database.rs` | `FaceModel`/`Database`, `apply_enrollment` (only merge implementation), trusted root-only storage, GUI payload types — no OpenCV |

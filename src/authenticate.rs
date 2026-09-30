@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
@@ -19,6 +20,8 @@ pub enum AuthOutcome {
     AllDark,
     /// Not a single frame could be read.
     NoFrames,
+    /// The caller stopped the attempt from its frame callback.
+    Cancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -59,7 +62,9 @@ impl AuthReport {
     }
 }
 
-/// Per-frame observation handed to the caller (CLI progress output).
+/// Per-frame observation handed to the caller (CLI progress, daemon events).
+/// Returning [`ControlFlow::Break`] from the callback ends the attempt as
+/// [`AuthOutcome::Cancelled`].
 pub struct FrameEvent<'a> {
     pub frame: &'a Frame,
     pub score: Option<f32>,
@@ -73,7 +78,7 @@ pub fn authenticate(
     cfg: &Config,
     model: &FaceModel,
     timeout: Duration,
-    mut on_frame: impl FnMut(FrameEvent<'_>),
+    mut on_frame: impl FnMut(FrameEvent<'_>) -> ControlFlow<()>,
 ) -> Result<AuthReport> {
     let started = Instant::now();
     let pause = Duration::from_millis(cfg.video.frame_interval_ms);
@@ -111,6 +116,16 @@ pub fn authenticate(
         match frame.analysis.verdict {
             FaceVerdict::TooDark => {
                 report.dark_frames += 1;
+                if on_frame(FrameEvent {
+                    frame: &frame,
+                    score: None,
+                    matched: false,
+                })
+                .is_break()
+                {
+                    report.outcome = AuthOutcome::Cancelled;
+                    break;
+                }
                 std::thread::sleep(pause);
                 continue;
             }
@@ -119,19 +134,29 @@ pub fn authenticate(
                 // A face was there but failed liveness: it breaks the streak.
                 report.face_frames += 1;
                 tracker.observe(f32::INFINITY, false);
-                on_frame(FrameEvent {
+                if on_frame(FrameEvent {
                     frame: &frame,
                     score: None,
                     matched: false,
-                });
+                })
+                .is_break()
+                {
+                    report.outcome = AuthOutcome::Cancelled;
+                    break;
+                }
                 continue;
             }
             _ => {
-                on_frame(FrameEvent {
+                if on_frame(FrameEvent {
                     frame: &frame,
                     score: None,
                     matched: false,
-                });
+                })
+                .is_break()
+                {
+                    report.outcome = AuthOutcome::Cancelled;
+                    break;
+                }
                 continue;
             }
         }
@@ -153,11 +178,15 @@ pub fn authenticate(
         let score = model.match_score(&embedding.vector, k);
         let matched = score < threshold;
         let done = tracker.observe(score, matched);
-        on_frame(FrameEvent {
+        let flow = on_frame(FrameEvent {
             frame: &frame,
             score: Some(score),
             matched,
         });
+        if !done && flow.is_break() {
+            report.outcome = AuthOutcome::Cancelled;
+            break;
+        }
         if done {
             report.outcome = AuthOutcome::Success;
             break;
@@ -167,7 +196,10 @@ pub fn authenticate(
     report.best_score = tracker.best_score();
     report.consecutive = tracker.consecutive();
     report.elapsed = started.elapsed();
-    if report.outcome != AuthOutcome::Success {
+    if !matches!(
+        report.outcome,
+        AuthOutcome::Success | AuthOutcome::Cancelled
+    ) {
         report.outcome = if report.frames_read == 0 {
             AuthOutcome::NoFrames
         } else if report.dark_frames == report.frames_read {

@@ -90,6 +90,38 @@ auth  sufficient  pam_exec.so quiet /usr/bin/faceauth-auth
 | 12 | Setup error: config, camera, models, or an untrusted model file |
 | 13 | Every frame was too dark (IR emitter off?) |
 
+### Screen lockers and `faceauthd`
+
+`sudo`, polkit and login managers run PAM as root, so `faceauth-auth` reads the model store and opens the camera itself. Screen lockers (swaylock, hyprlock, Quickshell lockers…) run as **your user** and cannot read the root-only store. For them, enable the daemon:
+
+```bash
+sudo systemctl enable --now faceauthd.socket
+```
+
+When `faceauth-auth` runs unprivileged, it connects to `/run/faceauth/faceauthd.sock` instead of opening the camera. It only accepts the result if `PAM_USER` is the account running the locker.
+
+What the daemon allows:
+
+- The caller's uid comes from the kernel (`SO_PEERCRED`). A user can only ever have **their own** face verified. Root may name any user.
+- There is one attempt at a time (one camera). After 5 failed attempts in a minute the daemon answers `busy` for that user.
+- It never sends images. The unlock decision stays with the locker.
+- It keeps the models loaded between attempts and closes the camera after each one. After 5 idle minutes it exits, and systemd starts it again on the next connection.
+
+Lockers that want live feedback (an animation while looking for a face) can talk to the socket directly. The protocol is one JSON object per line:
+
+```
+→ {"op":"verify"}                         (then optionally {"op":"cancel"})
+← {"event":"started"}
+← {"event":"frame","face":true,"dark":false,"score":0.48,"matched":true}
+← {"event":"result","outcome":"success"}
+```
+
+`outcome` is one of `success`, `no_match`, `too_dark`, `skipped`, `cancelled`, `busy`, `error`, with an optional `reason`. Possible reasons are `no_model`, `disabled`, `lid_closed`, `camera_unavailable`, `rate_limited`, `attempt_in_progress`, `not_allowed`, `setup_error` and `best_score=…`. Closing the connection cancels the attempt. Quick check:
+
+```bash
+echo '{"op":"verify"}' | socat - UNIX-CONNECT:/run/faceauth/faceauthd.sock
+```
+
 ## Commands
 
 All commands that read or change models need root.
