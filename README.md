@@ -215,6 +215,8 @@ Enrollment and authentication may use different devices (same model file), but s
 
 ## Graphical interface (`faceauth-ui`)
 
+If a desktop palette file exists (`$FACEAUTH_UI_PALETTE`, or `$XDG_STATE_HOME/nothing-rice/palette.json` from the nothing-rice desktop), the window follows it: colours from the wallpaper, pill controls, dot meters, and it re-reads the file every two seconds. The palette is JSON with `mode` (`dark`/`light`), `surface`, `surfaceHigh`, `on`, `muted`, `accent` and `outline` as `#rrggbb`. Without the file the stock look is used.
+
 - Russian or English depending on `LANG` (override with `FACEAUTH_LANG=ru|en`).
 - Camera picker (IR cameras marked), live preview with a target oval and hints (move closer, hold still, turn left/right…).
 - **Enroll**: new model or add to the existing one, into the main set or a variant.

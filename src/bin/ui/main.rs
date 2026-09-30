@@ -4,6 +4,7 @@
 //! read or write of the root-only model store goes through
 //! `pkexec faceauth import | verify | list | remove | rename-variant | clear`.
 
+mod style;
 mod worker;
 
 use std::collections::HashMap;
@@ -11,11 +12,12 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use iced::widget::button::Button;
 use iced::widget::{
     button, checkbox, column, container, image, pick_list, progress_bar, radio, row, scrollable,
     slider, text, text_input,
 };
-use iced::{Alignment, ContentFit, Element, Length, Subscription, Task};
+use iced::{Alignment, ContentFit, Element, Font, Length, Padding, Subscription, Task};
 
 use faceauth::config::Config;
 use faceauth::database::{EnrollMerge, ImportPayload, ModelSummary, VerifyPayload, VerifyResult};
@@ -94,6 +96,8 @@ enum Message {
     RunDoctor,
     DoctorDone(Result<Vec<Check>, String>),
     CopyPam,
+    /// Re-read the desktop palette if it changed.
+    PaletteTick,
 }
 
 struct App {
@@ -137,6 +141,10 @@ struct App {
     busy: bool,
 
     checks: Option<Vec<Check>>,
+
+    /// Desktop palette (nothing-rice), if one is installed.
+    palette: Option<style::Palette>,
+    palette_stamp: Option<std::time::SystemTime>,
 }
 
 impl App {
@@ -148,6 +156,7 @@ impl App {
         let ir = cfg.video.ir_mode;
         let threshold = cfg.recognition.distance_threshold as f32;
         let required = cfg.recognition.required_matches;
+        let (palette, palette_stamp) = style::load();
         let app = Self {
             cfg,
             config_source,
@@ -184,6 +193,8 @@ impl App {
             renames: HashMap::new(),
             busy: false,
             checks: None,
+            palette,
+            palette_stamp,
         };
         (app, Task::none())
     }
@@ -534,6 +545,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.status = t("setup.copied").to_string();
             return iced::clipboard::write(PAM_LINE.to_string());
         }
+        Message::PaletteTick => {
+            if style::modified() != app.palette_stamp {
+                (app.palette, app.palette_stamp) = style::load();
+            }
+        }
     }
     Task::none()
 }
@@ -628,10 +644,25 @@ fn on_worker(app: &mut App, ev: WorkerEvent) -> Task<Message> {
 }
 
 fn subscription(app: &App) -> Subscription<Message> {
-    match &app.job {
+    let camera = match &app.job {
         Some(job) => Subscription::run_with(job.clone(), worker::run).map(Message::Worker),
         None => Subscription::none(),
-    }
+    };
+    let palette =
+        iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::PaletteTick);
+    Subscription::batch([camera, palette])
+}
+
+/// A button in the desktop style when a palette is present.
+fn btn<'a>(app: &App, label: &'a str, primary: bool) -> Button<'a, Message> {
+    let padding = if app.palette.is_some() {
+        Padding::from([8, 18])
+    } else {
+        iced::widget::button::DEFAULT_PADDING
+    };
+    button(text(label))
+        .padding(padding)
+        .style(style::button_style(app.palette, primary))
 }
 
 fn labeled<'a>(
@@ -652,6 +683,7 @@ fn view(app: &App) -> Element<'_, Message> {
 
     let camera_picker: Element<'_, Message> = if app.devices.is_empty() {
         text_input("/dev/video0", &app.device)
+            .style(style::input_style(app.palette))
             .on_input(|s| {
                 Message::DeviceSelected(VideoDevice {
                     path: s,
@@ -667,24 +699,36 @@ fn view(app: &App) -> Element<'_, Message> {
             app.selected_device(),
             Message::DeviceSelected,
         )
+        .style(style::pick_style(app.palette))
+        .menu_style(style::menu_style(app.palette))
         .width(Length::Fixed(320.0))
         .into()
     };
     let busy = app.busy || app.enrolling;
-    let camera_button = button(text(if app.job.is_some() {
+    let camera_label = if app.job.is_some() {
         t("camera.stop")
     } else {
         t("camera.start")
-    }))
-    .on_press_maybe((!busy).then_some(Message::ToggleCamera));
+    };
+    let camera_button =
+        btn(app, camera_label, true).on_press_maybe((!busy).then_some(Message::ToggleCamera));
+
+    let title = if app.palette.is_some() {
+        text(t("app.title").to_uppercase())
+            .size(28)
+            .font(Font::with_name("Matrix Sans Print"))
+    } else {
+        text(t("app.title")).size(24)
+    };
 
     let header = column![
-        text(t("app.title")).size(24),
+        title,
         text(config_text).size(13),
         row![
             labeled(
                 "field.user",
                 text_input("", &app.username)
+                    .style(style::input_style(app.palette))
                     .on_input(Message::UsernameChanged)
                     .width(Length::Fixed(160.0)),
             ),
@@ -704,7 +748,15 @@ fn view(app: &App) -> Element<'_, Message> {
     .spacing(8);
 
     let tab_button = |tab: Tab, key: &'static str| {
-        button(text(t(key))).on_press_maybe((app.tab != tab).then_some(Message::TabSelected(tab)))
+        let selected = app.tab == tab;
+        let b = button(text(t(key))).style(style::tab_style(app.palette, selected));
+        if app.palette.is_some() {
+            // Styled tabs stay clickable so the selected one is not drawn as disabled.
+            b.padding(Padding::from([8, 18]))
+                .on_press(Message::TabSelected(tab))
+        } else {
+            b.on_press_maybe((!selected).then_some(Message::TabSelected(tab)))
+        }
     };
     let tabs = row![
         tab_button(Tab::Enroll, "tab.enroll"),
@@ -731,13 +783,26 @@ fn view(app: &App) -> Element<'_, Message> {
             .center_x(Length::Fixed(420.0))
             .into(),
     };
+    let matched = app.testing && app.streak >= app.required;
+    let preview: Element<'_, Message> = if app.palette.is_some() {
+        container(preview)
+            .padding(10)
+            .style(style::preview_frame(app.palette, matched))
+            .into()
+    } else {
+        preview
+    };
     let verdict_text = app.verdict.map(|v| t(v.message_key())).unwrap_or("");
     let preview_col = column![preview, text(verdict_text).size(16)].spacing(6);
 
+    let body = container(scrollable(body))
+        .padding(if app.palette.is_some() { 20 } else { 0 })
+        .width(Length::Fill)
+        .style(style::card(app.palette));
     let content = column![
         header,
         tabs,
-        row![scrollable(body).width(Length::Fill), preview_col].spacing(16),
+        row![body, preview_col].spacing(16),
         text(app.status.clone()).size(14),
     ]
     .spacing(12)
@@ -766,6 +831,7 @@ fn view_enroll(app: &App) -> Element<'_, Message> {
         labeled(
             "field.label",
             text_input("", &app.label)
+                .style(style::input_style(app.palette))
                 .on_input(Message::LabelChanged)
                 .width(Length::Fixed(180.0)),
         ),
@@ -783,7 +849,9 @@ fn view_enroll(app: &App) -> Element<'_, Message> {
         ),
         labeled(
             "field.target",
-            pick_list(targets, Some(app.target.clone()), Message::TargetSelected),
+            pick_list(targets, Some(app.target.clone()), Message::TargetSelected)
+                .style(style::pick_style(app.palette))
+                .menu_style(style::menu_style(app.palette)),
         ),
     ]
     .spacing(10);
@@ -792,18 +860,23 @@ fn view_enroll(app: &App) -> Element<'_, Message> {
         col = col.push(labeled(
             "field.new_variant",
             text_input("glasses", &app.new_variant)
+                .style(style::input_style(app.palette))
                 .on_input(Message::NewVariantChanged)
                 .width(Length::Fixed(160.0)),
         ));
     }
     let can_start = !app.enrolling && !app.busy && !app.user().is_empty();
     col = col.push(
-        button(text(t("enroll.start"))).on_press_maybe(can_start.then_some(Message::StartEnroll)),
+        btn(app, t("enroll.start"), true).on_press_maybe(can_start.then_some(Message::StartEnroll)),
     );
 
     if app.enrolling {
         let p = app.enroll_cur as f32 / app.enroll_tot.max(1) as f32;
-        col = col.push(progress_bar(0.0..=1.0, p)).push(text(tf(
+        let meter: Element<'_, Message> = match &app.palette {
+            Some(pal) => style::dot_meter(pal, app.enroll_tot.max(1), app.enroll_cur, None),
+            None => progress_bar(0.0..=1.0, p).into(),
+        };
+        col = col.push(meter).push(text(tf(
             "enroll.progress",
             &[&app.enroll_cur, &app.enroll_tot],
         )));
@@ -817,9 +890,10 @@ fn view_enroll(app: &App) -> Element<'_, Message> {
 fn view_test(app: &App) -> Element<'_, Message> {
     let mut col = column![
         row![
-            button(text(t("test.start")))
+            btn(app, t("test.start"), true)
                 .on_press_maybe((!app.testing && !app.enrolling).then_some(Message::StartTest)),
-            button(text(t("test.stop"))).on_press_maybe(app.testing.then_some(Message::StopTest)),
+            btn(app, t("test.stop"), false)
+                .on_press_maybe(app.testing.then_some(Message::StopTest)),
         ]
         .spacing(10)
     ]
@@ -831,7 +905,14 @@ fn view_test(app: &App) -> Element<'_, Message> {
                 // Bar fills as the score approaches 0 (a perfect match).
                 let range = (app.threshold * 2.0).max(0.1);
                 let fill = (1.0 - score / range).clamp(0.0, 1.0);
-                col = col.push(progress_bar(0.0..=1.0, fill)).push(text(tf(
+                let meter: Element<'_, Message> = match &app.palette {
+                    // 24 dots; the threshold sits in the middle (score == threshold).
+                    Some(pal) => {
+                        style::dot_meter(pal, 24, (fill * 24.0).round() as usize, Some(12))
+                    }
+                    None => progress_bar(0.0..=1.0, fill).into(),
+                };
+                col = col.push(meter).push(text(tf(
                     "test.score",
                     &[&format!("{score:.3}"), &format!("{:.3}", app.threshold)],
                 )));
@@ -842,6 +923,14 @@ fn view_test(app: &App) -> Element<'_, Message> {
             "test.streak",
             &[&app.streak.min(app.required), &app.required],
         )));
+        if let Some(pal) = &app.palette {
+            col = col.push(style::dot_meter(
+                pal,
+                app.required as usize,
+                app.streak.min(app.required) as usize,
+                None,
+            ));
+        }
         if app.streak >= app.required {
             col = col.push(text(t("test.pass")).size(20));
         }
@@ -851,7 +940,7 @@ fn view_test(app: &App) -> Element<'_, Message> {
 
 fn view_models(app: &App) -> Element<'_, Message> {
     let mut col = column![
-        button(text(t("models.load")))
+        btn(app, t("models.load"), true)
             .on_press_maybe((!app.busy && !app.user().is_empty()).then_some(Message::LoadModels)),
     ]
     .spacing(10);
@@ -873,12 +962,13 @@ fn view_models(app: &App) -> Element<'_, Message> {
                         row![
                             text(tf("models.variant", &[&v.label, &v.samples])),
                             text_input(&v.label, &new_name)
+                                .style(style::input_style(app.palette))
                                 .on_input(move |s| Message::RenameInput(for_input.clone(), s))
                                 .width(Length::Fixed(120.0)),
-                            button(text(t("models.rename"))).on_press_maybe(
+                            btn(app, t("models.rename"), false).on_press_maybe(
                                 (!app.busy).then_some(Message::RenameVariant(label.clone()))
                             ),
-                            button(text(t("models.delete"))).on_press_maybe(
+                            btn(app, t("models.delete"), false).on_press_maybe(
                                 (!app.busy).then_some(Message::RemoveVariant(label))
                             ),
                         ]
@@ -887,7 +977,7 @@ fn view_models(app: &App) -> Element<'_, Message> {
                     );
                 }
                 col = col.push(
-                    button(text(t("models.clear")))
+                    btn(app, t("models.clear"), false)
                         .on_press_maybe((!app.busy).then_some(Message::ClearModel)),
                 );
             }
@@ -899,18 +989,30 @@ fn view_models(app: &App) -> Element<'_, Message> {
 fn view_setup(app: &App) -> Element<'_, Message> {
     let mut col = column![
         text(t("setup.steps")),
-        button(text(t("setup.run"))).on_press_maybe((!app.busy).then_some(Message::RunDoctor)),
+        btn(app, t("setup.run"), true).on_press_maybe((!app.busy).then_some(Message::RunDoctor)),
     ]
     .spacing(10);
 
     if let Some(checks) = &app.checks {
         for c in checks {
-            let mark = match c.status {
-                Status::Ok => "✔",
-                Status::Warn => "⚠",
-                Status::Fail => "✘",
-            };
-            col = col.push(text(format!("{mark} {}: {}", c.name, c.detail)).size(14));
+            let line = text(format!("{}: {}", c.name, c.detail)).size(14);
+            col = col.push(match &app.palette {
+                Some(pal) => Element::from(
+                    row![style::status_dot(pal, c.status), line]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                ),
+                None => {
+                    let mark = match c.status {
+                        Status::Ok => "✔",
+                        Status::Warn => "⚠",
+                        Status::Fail => "✘",
+                    };
+                    text(format!("{mark} {}: {}", c.name, c.detail))
+                        .size(14)
+                        .into()
+                }
+            });
             if let Some(h) = &c.hint {
                 col = col.push(text(format!("    → {h}")).size(13));
             }
@@ -923,7 +1025,7 @@ fn view_setup(app: &App) -> Element<'_, Message> {
         .push(
             row![
                 text(PAM_LINE).size(13),
-                button(text(t("setup.copy"))).on_press(Message::CopyPam),
+                btn(app, t("setup.copy"), false).on_press(Message::CopyPam),
             ]
             .spacing(10)
             .align_y(Alignment::Center),
@@ -932,8 +1034,16 @@ fn view_setup(app: &App) -> Element<'_, Message> {
 }
 
 fn main() -> iced::Result {
+    // Interface font of the desktop, when its palette is installed.
+    let font = if style::load().0.is_some() {
+        Font::with_name("Space Grotesk")
+    } else {
+        Font::DEFAULT
+    };
     iced::application(App::new, update, view)
         .subscription(subscription)
+        .theme(|app: &App| style::theme(app.palette.as_ref()))
+        .default_font(font)
         .window(iced::window::Settings {
             size: iced::Size::new(980.0, 720.0),
             ..Default::default()
