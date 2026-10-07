@@ -73,6 +73,29 @@ pub fn lookup_user(name: &str) -> Result<UserInfo> {
     bail!("User lookup is only supported on Unix")
 }
 
+/// Account name for a uid (the daemon trusts `SO_PEERCRED`, never a name sent by a client).
+#[cfg(unix)]
+pub fn username_for_uid(uid: u32) -> Result<String> {
+    use std::ffi::CStr;
+
+    // SAFETY: `getpwuid` returns NULL or a pointer to static storage valid until the
+    // next passwd call; the name is copied out before returning.
+    let name = unsafe {
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() {
+            bail!("uid {uid} not found in passwd database");
+        }
+        CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned()
+    };
+    validate_username(&name)?;
+    Ok(name)
+}
+
+#[cfg(not(unix))]
+pub fn username_for_uid(uid: u32) -> Result<String> {
+    bail!("uid {uid}: user lookup is only supported on Unix")
+}
+
 /// The unprivileged user who asked for this command through `pkexec`, if any.
 /// `pkexec` sets `PKEXEC_UID` and clears the rest of the environment.
 pub fn pkexec_caller() -> Option<u32> {

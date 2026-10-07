@@ -152,6 +152,22 @@ pub struct Frame {
     pub analysis: FrameAnalysis,
 }
 
+/// Detector and recognizer without a camera.
+pub struct Models {
+    pub detector: Detector,
+    pub recognizer: FaceRecognizer,
+}
+
+impl Models {
+    /// Load both models (fails if the recognizer is missing).
+    pub fn load(cfg: &Config) -> Result<Self> {
+        Ok(Self {
+            detector: create_detector(&cfg.detection, &cfg.openvino, cfg.video.ir_mode)?,
+            recognizer: FaceRecognizer::from_config(&cfg.recognition, &cfg.openvino)?,
+        })
+    }
+}
+
 pub struct Pipeline {
     pub camera: Camera,
     pub detector: Detector,
@@ -161,15 +177,33 @@ pub struct Pipeline {
 impl Pipeline {
     /// Open the camera and load both models (fails if the recognizer is missing).
     pub fn open(cfg: &Config, device: &str) -> Result<Self> {
-        let camera = Camera::open_configured(device, &cfg.video)
-            .map_err(|e| e.context(format!("Failed to open camera {device}")))?;
-        let detector = create_detector(&cfg.detection, &cfg.openvino, cfg.video.ir_mode)?;
-        let recognizer = FaceRecognizer::from_config(&cfg.recognition, &cfg.openvino)?;
-        Ok(Self {
+        let camera = Self::open_camera(cfg, device)?;
+        let models = Models::load(cfg)?;
+        Ok(Self::with_models(camera, models))
+    }
+
+    /// Open only the camera, with the configured exposure and size.
+    pub fn open_camera(cfg: &Config, device: &str) -> Result<Camera> {
+        Camera::open_configured(device, &cfg.video)
+            .map_err(|e| e.context(format!("Failed to open camera {device}")))
+    }
+
+    /// Combine an open camera with already loaded models.
+    pub fn with_models(camera: Camera, models: Models) -> Self {
+        Self {
             camera,
-            detector,
-            recognizer,
-        })
+            detector: models.detector,
+            recognizer: models.recognizer,
+        }
+    }
+
+    /// Close the camera and keep the models (so a long-running daemon does not
+    /// reload them, or keep the camera light on, between attempts).
+    pub fn into_models(self) -> Models {
+        Models {
+            detector: self.detector,
+            recognizer: self.recognizer,
+        }
     }
 
     /// Read, detect and analyze one frame.

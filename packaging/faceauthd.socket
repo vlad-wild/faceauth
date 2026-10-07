@@ -1,0 +1,13 @@
+[Unit]
+Description=faceauth face verification socket (screen lockers)
+Documentation=file:///usr/share/doc/faceauth/README.md
+
+[Socket]
+ListenStream=/run/faceauth/faceauthd.sock
+# Any local user may ask; the daemon only ever verifies the caller's own face.
+SocketMode=0666
+DirectoryMode=0755
+Accept=no
+
+[Install]
+WantedBy=sockets.target

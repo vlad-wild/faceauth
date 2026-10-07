@@ -1,0 +1,34 @@
+[Unit]
+Description=faceauth face verification daemon
+Documentation=file:///usr/share/doc/faceauth/README.md
+Requires=faceauthd.socket
+After=faceauthd.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/faceauthd
+# Reads the root-only model store; exits by itself after 5 idle minutes.
+User=root
+
+# Camera, NPU and GPU access; nothing else.
+DevicePolicy=closed
+DeviceAllow=char-video4linux rw
+DeviceAllow=char-accel rw
+DeviceAllow=char-drm rw
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/cache/faceauth /var/log /run/faceauth
+ReadOnlyPaths=/var/lib/faceauth /etc/faceauth
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+SystemCallArchitectures=native

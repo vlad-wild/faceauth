@@ -1,4 +1,9 @@
-//! `faceauth-auth`: PAM helper run by `pam_exec` (as root).
+//! `faceauth-auth`: PAM helper run by `pam_exec`.
+//!
+//! As root (sudo, polkit, login managers) it opens the camera itself. Run by an
+//! unprivileged screen locker it cannot read the root-only model store, so it asks
+//! `faceauthd` to verify the calling user instead, and only when PAM is
+//! authenticating that same user.
 //!
 //! Exit codes (anything but 0 lets PAM fall through to the password):
 //! * 0  — face matched
@@ -10,14 +15,17 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::env;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use faceauth::authenticate::{AuthOutcome, authenticate};
 use faceauth::config::{Config, SYSTEM_CONFIG_PATH};
-use faceauth::database::{DISABLED_FLAG, load_user_model};
+use faceauth::daemon::{self, SOCKET_PATH};
+use faceauth::gate::{Gate, pre_auth_checks};
 use faceauth::logger;
 use faceauth::pipeline::Pipeline;
+use faceauth::privilege::{is_root, username_for_uid};
 use faceauth::session;
 
 const EXIT_SUCCESS: i32 = 0;
@@ -80,6 +88,46 @@ fn main() {
     std::process::exit(code);
 }
 
+/// Unprivileged mode: let `faceauthd` verify the calling user.
+fn run_via_daemon(user: &str) -> i32 {
+    if session::is_remote_pam_session() {
+        log::info!("Remote session (PAM_RHOST/PAM_TTY); skipping face authentication");
+        return EXIT_SKIPPED;
+    }
+    // The daemon verifies whoever owns this process. Only accept that result
+    // when PAM is authenticating the same account.
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    match username_for_uid(uid) {
+        Ok(own) if own == user => {}
+        Ok(own) => {
+            log::warn!("PAM user {user} is not the calling user {own}; skipping");
+            return EXIT_SKIPPED;
+        }
+        Err(e) => {
+            log::error!("{e:#}");
+            return EXIT_SETUP_ERROR;
+        }
+    }
+    match daemon::verify(
+        Path::new(SOCKET_PATH),
+        env::var("PAM_SERVICE").ok().as_deref(),
+        |_| {},
+    ) {
+        Ok((outcome, reason)) => {
+            log::info!(
+                "faceauthd result for {user}: {outcome:?}{}",
+                reason.map(|r| format!(" ({r})")).unwrap_or_default()
+            );
+            outcome.exit_code()
+        }
+        Err(e) => {
+            log::error!("{e:#}");
+            EXIT_SETUP_ERROR
+        }
+    }
+}
+
 fn run(args: Args) -> Result<i32> {
     if args.verbose {
         log::info!("Verbose output enabled");
@@ -92,26 +140,19 @@ fn run(args: Args) -> Result<i32> {
         }
     };
 
-    if Path::new(DISABLED_FLAG).exists() {
-        log::info!("Face authentication disabled ({DISABLED_FLAG}); skipping");
-        return Ok(EXIT_SKIPPED);
+    if !is_root() {
+        return Ok(run_via_daemon(&user));
     }
 
     let config = Config::load_resolved(&args.config)
         .with_context(|| format!("Failed to load config {}", args.config.display()))?;
 
-    if config.auth.skip_remote && session::is_remote_pam_session() {
-        log::info!("Remote session (PAM_RHOST/PAM_TTY); skipping face authentication");
-        return Ok(EXIT_SKIPPED);
-    }
-    if config.auth.skip_lid_closed && session::lid_closed() {
-        log::info!("Lid closed; skipping face authentication");
-        return Ok(EXIT_SKIPPED);
-    }
-
-    let Some(model) = load_user_model(&user)? else {
-        log::info!("No face model enrolled for user {}", user);
-        return Ok(EXIT_SKIPPED);
+    let model = match pre_auth_checks(&config, &user, session::is_remote_pam_session())? {
+        Gate::Proceed(model) => model,
+        Gate::Skip(reason) => {
+            log::info!("Skipping face authentication for {user}: {}", reason.key());
+            return Ok(EXIT_SKIPPED);
+        }
     };
 
     log::info!("Starting face authentication for user {}", user);
@@ -120,7 +161,9 @@ fn run(args: Args) -> Result<i32> {
     }
     let mut pipeline = Pipeline::open(&config, &config.video.device_path)?;
     let timeout = Duration::from_secs(config.video.timeout as u64);
-    let report = authenticate(&mut pipeline, &config, &model, timeout, |_| {})?;
+    let report = authenticate(&mut pipeline, &config, &model, timeout, |_| {
+        ControlFlow::Continue(())
+    })?;
 
     if config.debug.end_report {
         log::info!("Report for {}: {}", user, report.summary());
@@ -149,6 +192,10 @@ fn run(args: Args) -> Result<i32> {
                 user
             );
             EXIT_TOO_DARK
+        }
+        AuthOutcome::Cancelled => {
+            log::warn!("Authentication for {} was cancelled", user);
+            EXIT_NO_MATCH
         }
         AuthOutcome::NoFrames => {
             log::error!(

@@ -6,6 +6,7 @@ pub use crate::diagnostics::{Check, PAM_LINE, Status, print};
 
 use crate::camera::{self, Camera};
 use crate::config::Config;
+use crate::daemon::SOCKET_PATH;
 use crate::database::DISABLED_FLAG;
 use crate::matching::file_fingerprint;
 
@@ -17,6 +18,7 @@ pub fn run(cfg: &Config, config_source: Option<&Path>, user: Option<&str>) -> Ve
     checks.extend(check_openvino(cfg));
     checks.extend(check_storage(user));
     checks.extend(check_pam());
+    checks.push(check_daemon());
     if Path::new(DISABLED_FLAG).exists() {
         checks.push(
             Check::new("disabled", Status::Warn, format!("{DISABLED_FLAG} exists"))
@@ -24,6 +26,21 @@ pub fn run(cfg: &Config, config_source: Option<&Path>, user: Option<&str>) -> Ve
         );
     }
     checks
+}
+
+/// Screen lockers run unprivileged and reach the model store only through faceauthd.
+fn check_daemon() -> Check {
+    use std::os::unix::fs::FileTypeExt;
+
+    match std::fs::metadata(SOCKET_PATH) {
+        Ok(m) if m.file_type().is_socket() => Check::new("faceauthd", Status::Ok, SOCKET_PATH),
+        _ => Check::new(
+            "faceauthd",
+            Status::Warn,
+            format!("{SOCKET_PATH} not found (face unlock in screen lockers is unavailable)"),
+        )
+        .hint("sudo systemctl enable --now faceauthd.socket"),
+    }
 }
 
 fn check_config(source: Option<&Path>) -> Check {

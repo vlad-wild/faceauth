@@ -90,6 +90,64 @@ auth  sufficient  pam_exec.so quiet /usr/bin/faceauth-auth
 | 12 | Setup error: config, camera, models, or an untrusted model file |
 | 13 | Every frame was too dark (IR emitter off?) |
 
+### Screen lockers and `faceauthd`
+
+`sudo`, polkit and login managers run PAM as root, so `faceauth-auth` reads the model store and opens the camera itself. Screen lockers (swaylock, hyprlock, Quickshell lockers…) run as **your user** and cannot read the root-only store. For them, enable the daemon:
+
+```bash
+sudo systemctl enable --now faceauthd.socket
+```
+
+When `faceauth-auth` runs unprivileged, it connects to `/run/faceauth/faceauthd.sock` instead of opening the camera. It only accepts the result if `PAM_USER` is the account running the locker.
+
+What the daemon allows:
+
+- The caller's uid comes from the kernel (`SO_PEERCRED`). A user can only ever have **their own** face verified. Root may name any user.
+- There is one attempt at a time (one camera). After 5 failed attempts in a minute the daemon answers `busy` for that user.
+- It never sends images. The unlock decision stays with the locker.
+- It keeps the models loaded between attempts and closes the camera after each one. After 5 idle minutes it exits, and systemd starts it again on the next connection.
+
+Lockers that want live feedback (an animation while looking for a face) can talk to the socket directly. The protocol is one JSON object per line:
+
+```
+→ {"op":"verify"}                         (then optionally {"op":"cancel"})
+← {"event":"started"}
+← {"event":"frame","face":true,"dark":false,"score":0.48,"matched":true}
+← {"event":"result","outcome":"success"}
+```
+
+Other requests:
+
+- `{"op":"status"}` returns camera, backend and model summary.
+- `{"op":"history"}` returns your last 20 attempts, kept in memory only.
+- `{"op":"calibrate","frames":30}` streams progress and returns a suggested threshold.
+- `{"op":"password_only","seconds":60}` skips face authentication for you for up to 10 minutes; `0` clears it.
+
+`verify` also takes an optional `"service"` label for the history. `faceauth-auth` sends `PAM_SERVICE`.
+
+`outcome` is one of `success`, `no_match`, `too_dark`, `skipped`, `cancelled`, `busy`, `error`, with an optional `reason`. Possible reasons are `no_model`, `disabled`, `lid_closed`, `camera_unavailable`, `rate_limited`, `attempt_in_progress`, `not_allowed`, `setup_error` and `best_score=…`. Closing the connection cancels the attempt. Quick check:
+
+```bash
+echo '{"op":"verify"}' | socat - UNIX-CONNECT:/run/faceauth/faceauthd.sock
+```
+
+### Other front ends (desktop settings, shells)
+
+Everything `faceauth-ui` does is available to other programs:
+
+| Task | How | Privilege |
+|------|-----|-----------|
+| Enroll | `faceauth capture [--preview] [--variant NAME] [--append]` as the user (JSON lines), then pipe the final `payload` event's object into `pkexec faceauth import -u $USER` | camera access as the user; `import` asks for **your** password (`org.faceauth.manage-own-model`) |
+| List / remove / rename variants | `pkexec faceauth list --json` / `remove` / `rename-variant` / `clear` | your password |
+| Status, test, calibrate, attempt history | faceauthd requests `status`, `verify`, `calibrate`, `history` | none (your own face only) |
+| System settings, disable / enable | `pkexec /usr/lib/faceauth/faceauth-admin get \| set <key> <value> \| disable \| enable` | **administrator** password (`org.faceauth.configure`) |
+
+`faceauth capture` prints one JSON object per line: `started`, `frame` (`face`, `verdict`, optional `preview` as a PGM data URL), `sample` (`n`/`of`), `hint` (`turn_left`, `turn_right`, `look_straight`, `duplicate`), and finally `payload` or `error`. The embeddings are never written to disk.
+
+`faceauth-admin set` accepts only these keys, with range checks, and keeps the rest of `config.toml` (comments included) intact: `video.device_path`, `video.ir_mode`, `video.timeout`, `recognition.distance_threshold`, `recognition.required_matches`, `liveness.ir_check`, `auth.skip_lid_closed`, `openvino.device`. `auth.skip_remote` is deliberately not settable.
+
+**Password before changing the face model.** If face authentication is also enabled for polkit, `pkexec faceauth import` could be approved with the face itself. A front end should first send `{"op":"password_only","seconds":60}` to faceauthd. For that minute `faceauth-auth` skips face authentication for the calling user (including under polkit and sudo), so someone at an unlocked session cannot replace the owner's face. Any process of the user may set this flag, but the only effect is being asked for the password.
+
 ## Commands
 
 All commands that read or change models need root.
@@ -157,6 +215,8 @@ cache_dir = "/var/cache/faceauth/openvino"
 Enrollment and authentication may use different devices (same model file), but scores can differ slightly.
 
 ## Graphical interface (`faceauth-ui`)
+
+If a desktop palette file exists (`$FACEAUTH_UI_PALETTE`, or `$XDG_STATE_HOME/nothing-rice/palette.json` from the nothing-rice desktop), the window follows it: colours from the wallpaper, pill controls, dot meters, and it re-reads the file every two seconds. The palette is JSON with `mode` (`dark`/`light`), `surface`, `surfaceHigh`, `on`, `muted`, `accent` and `outline` as `#rrggbb`. Without the file the stock look is used.
 
 - Russian or English depending on `LANG` (override with `FACEAUTH_LANG=ru|en`).
 - Camera picker (IR cameras marked), live preview with a target oval and hints (move closer, hold still, turn left/right…).
