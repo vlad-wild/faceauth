@@ -187,9 +187,19 @@ fn check_openvino(cfg: &Config) -> Vec<Check> {
     }
     let time = |ov: &OpenVinoConfig| -> Result<(String, f64, f64), String> {
         let t = Instant::now();
-        let mut s = OpenVinoSession::from_onnx(model, ov).map_err(|e| format!("{e:#}"))?;
+        // Same static [1, 3, H, W] reshape as the recognition path
+        // (recognition.rs): EdgeFace's dynamic batch axis crashes the
+        // OpenVINO NPU compiler during AUTO's background import.
+        let mut s = OpenVinoSession::from_onnx_static_input(
+            model,
+            ov,
+            cfg.recognition.input_size as i64,
+            cfg.recognition.input_size as i64,
+        )
+        .map_err(|e| format!("{e:#}"))?;
         let load = t.elapsed().as_secs_f64() * 1000.0;
-        let input = ndarray::Array4::<f32>::zeros((1, 3, 112, 112));
+        let size = cfg.recognition.input_size;
+        let input = ndarray::Array4::<f32>::zeros((1, 3, size as usize, size as usize));
         let t = Instant::now();
         s.run(input).map_err(|e| format!("{e:#}"))?;
         Ok((
