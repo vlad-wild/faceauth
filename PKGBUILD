@@ -1,6 +1,6 @@
 # Maintainer: Vlad Wild <ya.vlash1@yandex.ru>
 pkgname=faceauth
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="Face authentication system for Linux using OpenVINO/ONNX"
 arch=('x86_64' 'aarch64')
@@ -53,7 +53,8 @@ package() {
 
   # Models
   local model
-  for model in MobileFaceNet.onnx ultra_light_640.onnx face_detection_yunet_2023mar.onnx; do
+  for model in MobileFaceNet.onnx edgeface_s_gamma_05.onnx scrfd_2.5g_kps.onnx \
+               ultra_light_640.onnx face_detection_yunet_2023mar.onnx; do
     install -Dm644 "models/$model" "$pkgdir/usr/share/faceauth/models/$model"
   done
 

@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use log::{info, warn};
 use ndarray::Array4;
-use openvino::{Core, DeviceType, ElementType, PropertyKey, RwPropertyKey, Shape, Tensor};
+use openvino::{
+    Core, DeviceType, ElementType, PartialShape, PropertyKey, RwPropertyKey, Shape, Tensor,
+};
 use std::path::PathBuf;
 
 use crate::config::OpenVinoConfig;
@@ -18,12 +20,41 @@ pub struct OpenVinoSession {
 
 impl OpenVinoSession {
     pub fn from_onnx(model_path: &str, cfg: &OpenVinoConfig) -> Result<Self> {
+        Self::with_static_input(model_path, cfg, None)
+    }
+
+    /// Like [`Self::from_onnx`], but first reshapes the single input to a fixed
+    /// `[1, 3, height, width]`. Needed for models exported with dynamic spatial
+    /// dimensions (SCRFD): a static graph compiles to a stable pipeline instead
+    /// of re-specializing on every new frame size.
+    pub fn from_onnx_static_input(
+        model_path: &str,
+        cfg: &OpenVinoConfig,
+        height: i64,
+        width: i64,
+    ) -> Result<Self> {
+        Self::with_static_input(model_path, cfg, Some((height, width)))
+    }
+
+    fn with_static_input(
+        model_path: &str,
+        cfg: &OpenVinoConfig,
+        static_hw: Option<(i64, i64)>,
+    ) -> Result<Self> {
         let mut core = Core::new().context("Failed to initialize OpenVINO core")?;
         let onnx_data = std::fs::read(model_path)
             .with_context(|| format!("Failed to read ONNX model {}", model_path))?;
-        let model = core
+        let mut model = core
             .read_model_from_buffer(&onnx_data, None)
             .context("Failed to read ONNX model into OpenVINO")?;
+
+        if let Some((height, width)) = static_hw {
+            let shape = PartialShape::new_static(4, &[1, 3, height, width])
+                .context("Failed to build the static input shape")?;
+            model
+                .reshape_single_input(&shape)
+                .context("Failed to reshape the model input")?;
+        }
 
         let available: Vec<String> = core
             .available_devices()
@@ -75,11 +106,16 @@ impl OpenVinoSession {
             .get_input_by_index(0)
             .context("Failed to get model input")?;
         let input_name = input_node.get_name().context("Failed to get input name")?;
-        let input_shape = input_node
-            .get_shape()
-            .context("Failed to get input shape")?
-            .get_dimensions()
-            .to_vec();
+        // Dynamic dimensions (e.g. an exported batch axis) have no static shape:
+        // report an empty one instead of failing the whole session, callers that
+        // need it must validate.
+        let input_shape = match input_node.get_shape() {
+            Ok(shape) => shape.get_dimensions().to_vec(),
+            Err(e) => {
+                warn!("OpenVINO input shape is dynamic ({e}); not reporting a static shape");
+                Vec::new()
+            }
+        };
 
         let output_count = compiled
             .get_output_size()

@@ -36,7 +36,38 @@ impl FaceEmbedding {
     }
 }
 
-type OnnxModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type OnnxModel = Arc<TypedRunnableModel>;
+
+/// Pixel normalization applied to the RGB face crop before inference. It must
+/// match the model: a mismatch still produces a vector, but one that compares
+/// badly against enrolled samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Normalization {
+    /// `(p − 127.5) / 128` — MobileFaceNet, ArcFace, SCRFD-style models.
+    InsightFace,
+    /// `(p − 127.5) / 127.5` — EdgeFace, most timm models (`Normalize(0.5)`).
+    Unit,
+}
+
+impl Normalization {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "insightface" | "mobilefacenet" | "arcface" => Ok(Self::InsightFace),
+            "unit" | "edgeface" => Ok(Self::Unit),
+            other => anyhow::bail!(
+                "Unknown recognition.normalization {other:?}; use \"insightface\" \
+                 ((p − 127.5) / 128) or \"unit\" ((p − 127.5) / 127.5)"
+            ),
+        }
+    }
+
+    fn apply(self, pixel: f32) -> f32 {
+        match self {
+            Self::InsightFace => (pixel - 127.5) / 128.0,
+            Self::Unit => (pixel - 127.5) / 127.5,
+        }
+    }
+}
 
 enum Backend {
     #[cfg(feature = "openvino")]
@@ -50,16 +81,33 @@ enum Backend {
 pub struct FaceRecognizer {
     backend: Backend,
     model_id: String,
+    input_size: usize,
+    normalization: Normalization,
 }
 
 impl FaceRecognizer {
     pub fn from_config(rc: &RecognitionConfig, ov: &OpenVinoConfig) -> Result<Self> {
-        Self::load(&rc.model_path, rc.use_openvino, ov)
+        if rc.input_size == 0 {
+            anyhow::bail!("recognition.input_size must be positive");
+        }
+        Self::load(
+            &rc.model_path,
+            rc.use_openvino,
+            ov,
+            rc.input_size as usize,
+            Normalization::parse(&rc.normalization)?,
+        )
     }
 
     /// Load model. With `use_openvino` (and the feature compiled in) OpenVINO is
     /// tried first; tract-onnx runs the same model on CPU otherwise.
-    pub fn load(model_path: &str, use_openvino: bool, ov: &OpenVinoConfig) -> Result<Self> {
+    pub fn load(
+        model_path: &str,
+        use_openvino: bool,
+        ov: &OpenVinoConfig,
+        input_size: usize,
+        normalization: Normalization,
+    ) -> Result<Self> {
         let path = Path::new(model_path);
         if !path.exists() {
             anyhow::bail!("Recognition model not found: {model_path}");
@@ -68,12 +116,21 @@ impl FaceRecognizer {
 
         #[cfg(feature = "openvino")]
         if use_openvino {
-            match crate::openvino_backend::OpenVinoSession::from_onnx(model_path, ov) {
+            // Models exported with a dynamic batch (EdgeFace) crash the OpenVINO
+            // NPU compiler during import; a static [1, 3, H, W] input avoids it.
+            match crate::openvino_backend::OpenVinoSession::from_onnx_static_input(
+                model_path,
+                ov,
+                input_size as i64,
+                input_size as i64,
+            ) {
                 Ok(session) => {
                     info!("Recognition loaded via OpenVINO on {}", session.device());
                     return Ok(Self {
                         backend: Backend::OpenVino(session),
                         model_id,
+                        input_size,
+                        normalization,
                     });
                 }
                 Err(e) => {
@@ -87,7 +144,7 @@ impl FaceRecognizer {
         let model = tract_onnx::onnx()
             .model_for_path(path)
             .context("Failed to read ONNX model")?
-            .with_input_fact(0, f32::fact([1, 3, 112, 112]).into())
+            .with_input_fact(0, f32::fact([1, 3, input_size, input_size]).into())
             .context("Failed to set model input fact")?
             .into_optimized()
             .context("Failed to optimize ONNX model")?
@@ -97,6 +154,8 @@ impl FaceRecognizer {
         Ok(Self {
             backend: Backend::Onnx(model),
             model_id,
+            input_size,
+            normalization,
         })
     }
 
@@ -117,8 +176,12 @@ impl FaceRecognizer {
     pub fn extract(&mut self, face_image: &opencv::core::Mat) -> Result<FaceEmbedding> {
         match &mut self.backend {
             #[cfg(feature = "openvino")]
-            Backend::OpenVino(session) => extract_openvino_embedding(session, face_image),
-            Backend::Onnx(model) => extract_onnx_embedding(model, face_image),
+            Backend::OpenVino(session) => {
+                extract_openvino_embedding(session, face_image, self.input_size, self.normalization)
+            }
+            Backend::Onnx(model) => {
+                extract_onnx_embedding(model, face_image, self.input_size, self.normalization)
+            }
         }
     }
 }
@@ -127,8 +190,10 @@ impl FaceRecognizer {
 fn extract_openvino_embedding(
     session: &mut crate::openvino_backend::OpenVinoSession,
     face_image: &opencv::core::Mat,
+    input_size: usize,
+    normalization: Normalization,
 ) -> Result<FaceEmbedding> {
-    let input = preprocess_for_mobilefacenet(face_image)?;
+    let input = preprocess_face(face_image, input_size, normalization)?;
     let outputs = session.run(input).context("OpenVINO inference failed")?;
     let (_, data) = outputs
         .into_iter()
@@ -143,14 +208,16 @@ fn extract_openvino_embedding(
 fn extract_onnx_embedding(
     model: &OnnxModel,
     face_image: &opencv::core::Mat,
+    input_size: usize,
+    normalization: Normalization,
 ) -> Result<FaceEmbedding> {
-    let input = preprocess_for_mobilefacenet(face_image)?;
+    let input = preprocess_face(face_image, input_size, normalization)?;
     let outputs = model
-        .run(tvec!(input.into_tensor().into()))
+        .run(tvec!(input.into_tvalue()))
         .context("ONNX run failed")?;
     let output = outputs.first().context("ONNX model returned no outputs")?;
     let view = output
-        .to_array_view::<f32>()
+        .to_plain_array_view::<f32>()
         .context("ONNX output is not f32 tensor")?;
     let vec = view.iter().copied().collect::<Vec<f32>>();
     if vec.is_empty() {
@@ -159,7 +226,12 @@ fn extract_onnx_embedding(
     Ok(FaceEmbedding::new(vec))
 }
 
-fn preprocess_for_mobilefacenet(face_image: &opencv::core::Mat) -> Result<Array4<f32>> {
+/// BGR face → RGB `input_size²` blob normalized with the model's convention.
+fn preprocess_face(
+    face_image: &opencv::core::Mat,
+    input_size: usize,
+    normalization: Normalization,
+) -> Result<Array4<f32>> {
     let mut rgb = Mat::default();
     opencv::imgproc::cvt_color(
         face_image,
@@ -168,11 +240,12 @@ fn preprocess_for_mobilefacenet(face_image: &opencv::core::Mat) -> Result<Array4
         0,
         AlgorithmHint::ALGO_HINT_DEFAULT,
     )?;
+    let side = input_size as i32;
     let mut resized = Mat::default();
     opencv::imgproc::resize(
         &rgb,
         &mut resized,
-        Size::new(112, 112),
+        Size::new(side, side),
         0.0,
         0.0,
         opencv::imgproc::INTER_AREA,
@@ -182,28 +255,27 @@ fn preprocess_for_mobilefacenet(face_image: &opencv::core::Mat) -> Result<Array4
         resized = resized.try_clone()?;
     }
     let pixels = resized.data_bytes()?;
-    if pixels.len() < 112 * 112 * 3 {
+    if pixels.len() < input_size * input_size * 3 {
         anyhow::bail!("Unexpected pixel buffer size after face preprocessing");
     }
 
-    let mut input = Array4::<f32>::zeros((1, 3, 112, 112));
-    for y in 0..112usize {
-        for x in 0..112usize {
-            let idx = (y * 112 + x) * 3;
+    let mut input = Array4::<f32>::zeros((1, 3, input_size, input_size));
+    for y in 0..input_size {
+        for x in 0..input_size {
+            let idx = (y * input_size + x) * 3;
             let r = pixels[idx] as f32;
             let g = pixels[idx + 1] as f32;
             let b = pixels[idx + 2] as f32;
 
-            // Typical MobileFaceNet normalization to [-1, 1]
-            input[[0, 0, y, x]] = (r - 127.5) / 128.0;
-            input[[0, 1, y, x]] = (g - 127.5) / 128.0;
-            input[[0, 2, y, x]] = (b - 127.5) / 128.0;
+            input[[0, 0, y, x]] = normalization.apply(r);
+            input[[0, 1, y, x]] = normalization.apply(g);
+            input[[0, 2, y, x]] = normalization.apply(b);
         }
     }
     Ok(input)
 }
 
-/// Align a face using landmarks from YuNet (or any 5-point detector).
+/// Align a face using 5-point landmarks from the detector (SCRFD, YuNet).
 ///
 /// **5 landmarks** — computes a full least-squares affine transform (6 DOF) that
 /// maps all five detected points to InsightFace canonical positions. This
@@ -214,8 +286,8 @@ fn preprocess_for_mobilefacenet(face_image: &opencv::core::Mat) -> Result<Array4
 /// in-plane rotation and scale only.
 ///
 /// `image` — full BGR frame.
-/// `landmarks` — points from YuNet: [right_eye, left_eye, nose, right_mouth, left_mouth].
-/// `output_size` — width/height of the output square (e.g. 112 for MobileFaceNet).
+/// `landmarks` — points in detector order: [right_eye, left_eye, nose, right_mouth, left_mouth].
+/// `output_size` — width/height of the output square (e.g. 112 for MobileFaceNet / EdgeFace).
 ///
 /// Returns an `output_size × output_size` aligned BGR face.
 pub fn align_face(image: &Mat, landmarks: &[Point2f], output_size: i32) -> Result<Mat> {
@@ -437,6 +509,23 @@ mod tests {
         for (got, want) in a.iter().zip(expected) {
             assert!((got - want).abs() < 1e-4, "{a:?}");
         }
+    }
+
+    #[test]
+    fn normalization_parses_known_aliases() {
+        for s in ["insightface", "InsightFace", "mobilefacenet", "arcface"] {
+            assert_eq!(Normalization::parse(s).unwrap(), Normalization::InsightFace);
+        }
+        for s in ["unit", "edgeface", " Unit "] {
+            assert_eq!(Normalization::parse(s).unwrap(), Normalization::Unit);
+        }
+    }
+
+    #[test]
+    fn normalization_rejects_unknown_values() {
+        // Must fail closed: a typo would silently mis-normalize every embedding.
+        assert!(Normalization::parse("minmax").is_err());
+        assert!(Normalization::parse("").is_err());
     }
 
     #[test]

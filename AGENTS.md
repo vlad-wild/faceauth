@@ -1,7 +1,7 @@
 # Faceauth — Agent Guide
 
 ## Overview
-`faceauth` is a face-authentication system for Linux, written in Rust. It captures a face from a webcam, extracts an embedding with an ONNX neural net (MobileFaceNet), and verifies it against stored per-user JSON models.
+`faceauth` is a face-authentication system for Linux, written in Rust. It captures a face from a webcam, extracts an embedding with an ONNX neural net (EdgeFace-S by default, MobileFaceNet supported), and verifies it against stored per-user JSON models.
 
 ## Architecture
 - **CLI** (`src/main.rs`) – `faceauth` binary: enroll, list/remove/rename, test, calibrate, migrate, doctor, and the `import`/`verify` helpers used by the GUI through `pkexec`.
@@ -19,9 +19,9 @@
 | `privilege.rs` | `require_root`, `authorize_for_user` / `authorize_global` (a pkexec caller may only touch their own model), passwd lookup |
 | `session.rs` | Remote-session (`PAM_RHOST`/`PAM_TTY`) and lid checks |
 | `camera.rs` | V4L2 capture, rotation, downscaling, `roi_stats`, `sharpness` |
-| `detection.rs` | YuNet (per-frame `set_input_size`), Ultra-Light, Haar; `clip_rect`, NMS, `estimate_yaw`/`estimate_pitch` |
-| `recognition.rs` | MobileFaceNet (OpenVINO → tract), 5-point alignment; **fails closed** (no fallback embedding) |
-| `openvino_backend.rs` | OpenVINO session: `AUTO`/NPU/GPU/CPU (`choose_device`), `CACHE_DIR`, `LATENCY` hint, one reused infer request |
+| `detection.rs` | SCRFD (letterbox + anchor decode, landmarks), YuNet (per-frame `set_input_size`), Ultra-Light, Haar; `clip_rect`, NMS, `estimate_yaw`/`estimate_pitch` |
+| `recognition.rs` | EdgeFace/MobileFaceNet (OpenVINO → tract), `Normalization` (`insightface`/`unit`), 5-point alignment; **fails closed** (no fallback embedding) |
+| `openvino_backend.rs` | OpenVINO session: `AUTO`/NPU/GPU/CPU (`choose_device`), `CACHE_DIR`, `LATENCY` hint, one reused infer request, `from_onnx_static_input` |
 | `config.rs` | TOML schema with struct-level defaults, `Config::discover`, model path resolution |
 | `doctor.rs` / `diagnostics.rs` | `faceauth doctor` checks / serializable result types |
 | `i18n.rs` | ru/en message table (`t`, `tf`) |
@@ -38,7 +38,7 @@ cargo test
 cargo test --no-default-features
 cargo clippy --all-targets -- -D warnings
 ```
-Unit tests cover config compatibility, merge logic, storage permission policy, payload validation, top-k scoring, the streak tracker, pose collection, remote-session detection, alignment math, NMS/clipping, pose estimates, OpenVINO device choice and i18n. Camera behaviour is still tested manually (`sudo faceauth test -u <user>`, `sudo faceauth doctor`). CI (`.github/workflows/ci.yml`) runs on Arch Linux (OpenCV 5.0) because Ubuntu's OpenCV is older than 4.11.
+Unit tests cover config compatibility, merge logic, storage permission policy, payload validation, top-k scoring, the streak tracker, pose collection, remote-session detection, alignment math, NMS/clipping, pose estimates, SCRFD level grouping/decode/letterbox, normalization parsing, OpenVINO device choice and i18n. Camera behaviour is still tested manually (`sudo faceauth test -u <user>`, `sudo faceauth doctor`). CI (`.github/workflows/ci.yml`) runs on Arch Linux (OpenCV 5.0) because Ubuntu's OpenCV is older than 4.11.
 
 ## Code style
 - Standard `cargo fmt` / `cargo clippy` (edition 2024, let-chains are fine).
@@ -50,10 +50,13 @@ Unit tests cover config compatibility, merge logic, storage permission policy, p
 ## Key implementation notes for agents
 
 ### 1. Face detector selection
-`create_detector(&DetectionConfig, &OpenVinoConfig, ir_mode)`:
-- YuNet whenever `yunet_path` is set and loads (independent of `use_cnn`); a configured `…2026may.onnx` falls back to the sibling `…2023mar.onnx`.
+`create_detector(&DetectionConfig, &OpenVinoConfig, ir_mode)` — first model that loads wins:
+- **SCRFD** (`scrfd_path`, default `$SYSTEM_MODELS_DIR/scrfd_2.5g_kps.onnx`) when the path is non-empty and the file exists; `scrfd_input_size` (default 640) is rounded up to a multiple of 32.
+- Then YuNet whenever `yunet_path` is set and loads (independent of `use_cnn`); a configured `…2026may.onnx` falls back to the sibling `…2023mar.onnx`.
 - Then Ultra-Light if `use_cnn = true`, then the Haar cascade (`DEFAULT_HAAR_CASCADE`, `minNeighbors` 2 in IR mode, else 3).
-- YuNet calls `set_input_size(frame size)` so frames are never stretched.
+- YuNet calls `set_input_size(frame size)` so frames are never stretched; SCRFD letterboxes into a square canvas and maps detections back (`sx`/`sy`).
+
+**SCRFD specifics** (`ScrfdDetector`): outputs are grouped by trailing dim — 1 = scores, 4 = bbox, 10 = landmarks — and mapped back to `(stride, anchors)` from the row count. Decode follows `insightface.model_zoo.scrfd`: anchor centers at multiples of the stride (2 anchors per cell, cell-major), distances × stride, NMS on top. Landmark order matches YuNet's positionally (smaller-x eye first), so `align_face` needs no special case.
 
 ### 2. Face crop padding and alignment
 - **YuNet**: `align_face()` maps the five landmarks to `CANONICAL_LANDMARKS_112` with a least-squares affine transform (2-point similarity with fewer landmarks).
@@ -63,14 +66,17 @@ Unit tests cover config compatibility, merge logic, storage permission policy, p
 Darkness (skipped in `ir_mode` except fully black frames) → confidence → face area within `min_face_size_ratio`..`max_face_size_ratio` (largest valid face wins) → IR liveness (`[liveness]`, IR only) → in enrollment also yaw/pitch limits and Laplacian sharpness. The resulting `FaceVerdict` feeds logs, CLI hints and the GUI overlay.
 
 ### 4. Model input shapes
+- **SCRFD**: `[1, 3, N, N]` with `N = scrfd_input_size`; RGB, `(p − 127.5) / 128`, black letterbox padding.
 - **Ultra-Light**: input shape read from the model; boxes are normalized, clamped, then scaled to the frame.
-- **MobileFaceNet**: `[1, 3, 112, 112]`, pixels normalized to `[-1, 1]` via `(pixel − 127.5) / 128.0`.
+- **EdgeFace / MobileFaceNet**: `[1, 3, H, H]` with `H = recognition.input_size` (112), RGB. Normalization comes from `recognition.normalization`: `"unit"` = `(p − 127.5) / 127.5` (EdgeFace), `"insightface"` = `(p − 127.5) / 128` (MobileFaceNet); unknown values fail closed. The struct defaults stay `insightface` for backward compatibility, so switching models requires setting both `model_path` and `normalization` in the config.
+- **OpenVINO dynamic shapes**: models exported with a dynamic batch/spatial dim (EdgeFace `batch_size`, SCRFD `?`×`?`) must go through `OpenVinoSession::from_onnx_static_input`, which reshapes the input to a static `[1, 3, H, W]` before compiling. The NPU compiler (`libopenvino_intel_npu_compiler.so`) **segfaults** on partially dynamic graphs.
+- **tract ≥ 0.23 is required**: tract 0.22 mis-evaluates ONNX `Resize` nodes that carry an empty `scales` tensor plus a computed `sizes` tensor (SCRFD's FPN) — it skips the actual resize while declaring the larger shape, producing garbage outputs and out-of-bounds reads in `tract-linalg`. Do not downgrade.
 
 ### 5. Config
 - Discovery (CLI/GUI as a normal user): `./faceauth.toml` → `~/.config/faceauth/config.toml` → `/etc/faceauth/config.toml`. **As root only `/etc/faceauth/config.toml`** (or an explicit `--config`, refused under pkexec). `faceauth-auth` takes `--config` (default `/etc/faceauth/config.toml`).
 - Every struct has `#[serde(default)]` + `impl Default`: add new fields there; old configs keep parsing, removed keys are ignored.
 - Relative model paths resolve against the config file; missing paths fall back to `/usr/share/faceauth/models/<file name>`.
-- Sections: `[video]`, `[detection]`, `[recognition]` (`distance_threshold`, `required_matches`, `top_k`), `[liveness]`, `[openvino]` (`device`, `cache_dir`), `[auth]` (`skip_remote`, `skip_lid_closed`), `[enroll]`, `[debug]` (`end_report`). Reference: `packaging/config.toml`.
+- Sections: `[video]`, `[detection]` (`scrfd_path`, `scrfd_input_size`, `yunet_path`, …), `[recognition]` (`model_path`, `input_size`, `normalization`, `distance_threshold`, `required_matches`, `top_k`), `[liveness]`, `[openvino]` (`device`, `cache_dir`), `[auth]` (`skip_remote`, `skip_lid_closed`), `[enroll]`, `[debug]` (`end_report`). Reference: `packaging/config.toml`.
 
 ### 6. Database format and storage
 - Store: `/var/lib/faceauth/models/<user>.json` (dir 0700 root, files 0600 root). `Database::load_trusted` refuses symlinks, non-root owners and group/other permissions; `save_secure` writes atomically.

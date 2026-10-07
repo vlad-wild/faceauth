@@ -124,6 +124,7 @@ fn check_models(cfg: &Config) -> Vec<Check> {
         out.push(c);
     };
     model("recognizer", &cfg.recognition.model_path, true);
+    model("scrfd", &cfg.detection.scrfd_path, false);
     model("yunet", &cfg.detection.yunet_path, false);
     if cfg.detection.use_cnn {
         model("ultra-light", &cfg.detection.model_path, false);

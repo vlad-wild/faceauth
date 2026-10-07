@@ -60,7 +60,13 @@ impl Default for VideoConfig {
 #[serde(default)]
 pub struct DetectionConfig {
     pub model_path: String,
-    /// YuNet model. When set and loadable, YuNet is used regardless of `use_cnn`.
+    /// SCRFD model (InsightFace). When set and loadable, SCRFD is used first —
+    /// it beats YuNet on WIDER FACE and returns 5 landmarks for alignment.
+    pub scrfd_path: String,
+    /// Square SCRFD network input (rounded up to a multiple of 32). Frames are
+    /// letterboxed into it, so non-square frames are never stretched.
+    pub scrfd_input_size: i32,
+    /// YuNet model. Used when SCRFD is unavailable, regardless of `use_cnn`.
     pub yunet_path: String,
     pub use_cnn: bool,
     pub confidence_threshold: f64,
@@ -75,6 +81,8 @@ impl Default for DetectionConfig {
     fn default() -> Self {
         Self {
             model_path: format!("{SYSTEM_MODELS_DIR}/ultra_light_640.onnx"),
+            scrfd_path: format!("{SYSTEM_MODELS_DIR}/scrfd_2.5g_kps.onnx"),
+            scrfd_input_size: 640,
             yunet_path: format!("{SYSTEM_MODELS_DIR}/face_detection_yunet_2023mar.onnx"),
             use_cnn: false,
             confidence_threshold: 0.7,
@@ -91,6 +99,13 @@ impl Default for DetectionConfig {
 #[serde(default)]
 pub struct RecognitionConfig {
     pub model_path: String,
+    /// Network input square side (EdgeFace and MobileFaceNet: 112).
+    pub input_size: u32,
+    /// Pixel normalization applied after the BGR→RGB conversion:
+    /// `"insightface"` = (p − 127.5) / 128 (MobileFaceNet, ArcFace, SCRFD),
+    /// `"unit"` = (p − 127.5) / 127.5 (EdgeFace, most timm models).
+    /// Must match the model, otherwise embeddings are silently wrong.
+    pub normalization: String,
     pub distance_threshold: f64,
     pub use_openvino: bool,
     /// Consecutive matching frames required for a successful authentication.
@@ -103,6 +118,8 @@ impl Default for RecognitionConfig {
     fn default() -> Self {
         Self {
             model_path: format!("{SYSTEM_MODELS_DIR}/MobileFaceNet.onnx"),
+            input_size: 112,
+            normalization: "insightface".to_string(),
             distance_threshold: 0.6,
             use_openvino: true,
             required_matches: 3,
@@ -253,6 +270,9 @@ impl Config {
     fn resolve_model_paths(&mut self, base: Option<&Path>) {
         resolve_model_path(&mut self.recognition.model_path, base);
         resolve_model_path(&mut self.detection.model_path, base);
+        if !self.detection.scrfd_path.is_empty() {
+            resolve_model_path(&mut self.detection.scrfd_path, base);
+        }
         if !self.detection.yunet_path.is_empty() {
             resolve_model_path(&mut self.detection.yunet_path, base);
         }
@@ -341,6 +361,34 @@ save_successful = false
         assert!(cfg.recognition.model_path.starts_with(SYSTEM_MODELS_DIR));
         assert_eq!(cfg.openvino.device, "AUTO");
         assert_eq!(cfg.recognition.required_matches, 3);
+    }
+
+    #[test]
+    fn new_model_keys_default() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.detection.scrfd_path.ends_with("scrfd_2.5g_kps.onnx"));
+        assert_eq!(cfg.detection.scrfd_input_size, 640);
+        // Recognition defaults stay MobileFaceNet-compatible so old configs
+        // keep working after an upgrade.
+        assert_eq!(cfg.recognition.input_size, 112);
+        assert_eq!(cfg.recognition.normalization, "insightface");
+        // Unknown legacy keys (embedding_size, …) are still ignored.
+        let legacy: Config =
+            toml::from_str("[recognition]\nembedding_size = 128\nnormalization = \"unit\"\n")
+                .unwrap();
+        assert_eq!(legacy.recognition.normalization, "unit");
+    }
+
+    #[test]
+    fn packaged_config_uses_edgeface() {
+        let cfg: Config = toml::from_str(include_str!("../packaging/config.toml")).unwrap();
+        assert_eq!(cfg.recognition.normalization, "unit");
+        assert!(
+            cfg.recognition
+                .model_path
+                .ends_with("edgeface_s_gamma_05.onnx")
+        );
+        assert!(!cfg.detection.scrfd_path.is_empty());
     }
 
     #[test]

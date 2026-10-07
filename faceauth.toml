@@ -9,6 +9,8 @@ exposure = -1
 ir_mode = true
 
 [detection]
+scrfd_path = "/etc/faceauth/models/scrfd_2.5g_kps.onnx"
+scrfd_input_size = 640
 model_path = "/etc/faceauth/models/ultra_light_640.onnx"
 yunet_path = "/etc/faceauth/models/face_detection_yunet_2023mar.onnx"
 use_cnn = true
@@ -19,8 +21,9 @@ min_face_size_ratio = 0.05
 max_face_size_ratio = 0.75
 
 [recognition]
-model_path = "/etc/faceauth/models/MobileFaceNet.onnx"
-embedding_size = 128
+model_path = "/etc/faceauth/models/edgeface_s_gamma_05.onnx"
+input_size = 112
+normalization = "unit"
 distance_threshold = 0.6
 
 [debug]

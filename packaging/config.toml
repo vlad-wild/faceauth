@@ -15,10 +15,14 @@ ir_mode = false            # true for monochrome IR cameras (Windows Hello-style
 frame_interval_ms = 30     # pause after a failed/black frame
 
 [detection]
+# Detector priority: SCRFD → YuNet → Ultra-Light → Haar. Set scrfd_path = ""
+# to skip SCRFD (the fallbacks below are then used as before).
+scrfd_path = "/usr/share/faceauth/models/scrfd_2.5g_kps.onnx"
+scrfd_input_size = 640       # network input; rounded up to a multiple of 32
 yunet_path = "/usr/share/faceauth/models/face_detection_yunet_2023mar.onnx"
 model_path = "/usr/share/faceauth/models/ultra_light_640.onnx"
 use_cnn = false            # Ultra-Light fallback when YuNet is unavailable
-confidence_threshold = 0.7
+confidence_threshold = 0.7  # SCRFD scores a bit lower than YuNet's; try 0.5–0.6 if faces are missed
 nms_threshold = 0.5
 face_padding = 0.15
 min_face_size_ratio = 0.05
@@ -26,7 +30,9 @@ max_face_size_ratio = 0.75
 use_openvino = true
 
 [recognition]
-model_path = "/usr/share/faceauth/models/MobileFaceNet.onnx"
+model_path = "/usr/share/faceauth/models/edgeface_s_gamma_05.onnx"
+input_size = 112            # network input side (height = width)
+normalization = "unit"      # EdgeFace: (p − 127.5) / 127.5; "insightface" for MobileFaceNet
 distance_threshold = 0.6   # tune with `sudo faceauth calibrate -u <user>`
 required_matches = 3       # consecutive matching frames needed
 top_k = 3                  # score = mean of the k nearest enrolled samples

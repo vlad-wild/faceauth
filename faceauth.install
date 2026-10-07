@@ -10,6 +10,22 @@ MSG
 }
 
 post_upgrade() {
+  # 0.4.0 switches the default models to SCRFD detection + EdgeFace recognition.
+  # Embeddings extracted by a different model are not comparable, so every user
+  # has to be enrolled again.
+  if [ "$(vercmp "$2" 0.4.0)" -lt 0 ]; then
+    cat <<'MSG'
+==> faceauth 0.4: new models (SCRFD detector, EdgeFace recognition).
+    Embeddings extracted by the old MobileFaceNet model are not compatible with
+    EdgeFace — re-enroll every enrolled user:
+      sudo faceauth add -u "$USER"
+    Then retune the threshold:
+      sudo faceauth calibrate -u "$USER"
+    Existing configs keep working: old files fall back to YuNet/MobileFaceNet
+    until you add the new keys (see /usr/share/doc/faceauth/config.toml).
+MSG
+  fi
+
   # 0.3.0 moved face models from ~/.local/share/faceauth (user-writable) to /var/lib/faceauth.
   if [ "$(vercmp "$2" 0.3.0)" -lt 0 ]; then
     cat <<'MSG'

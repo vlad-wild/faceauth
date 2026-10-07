@@ -111,7 +111,7 @@ pub fn clip_rect(r: Rect, cols: i32, rows: i32) -> Option<Rect> {
     (x2 > x1 && y2 > y1).then(|| Rect::new(x1, y1, x2 - x1, y2 - y1))
 }
 
-type OnnxModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type OnnxModel = Arc<TypedRunnableModel>;
 
 enum UltraLightBackend {
     #[cfg(feature = "openvino")]
@@ -145,31 +145,35 @@ impl UltraLightDetector {
 
         #[cfg(feature = "openvino")]
         if use_openvino {
-            match crate::openvino_backend::OpenVinoSession::from_onnx(model_path, ov) {
-                Ok(session) => {
-                    log::info!(
-                        "Ultra-Light detector loaded via OpenVINO on {}",
-                        session.device()
-                    );
-                    let shape = &session.input_shape;
-                    let height = shape
-                        .get(2)
-                        .copied()
-                        .context("Cannot get input height from OpenVINO model")?
-                        as usize;
-                    let width = shape
-                        .get(3)
-                        .copied()
-                        .context("Cannot get input width from OpenVINO model")?
-                        as usize;
-                    return Ok(Self {
-                        backend: UltraLightBackend::OpenVino(session),
-                        width,
-                        height,
-                        prob_threshold,
-                        nms_threshold,
-                    });
-                }
+            // The whole OpenVINO attempt (including reading the static input
+            // shape) must fail soft: a dynamic export falls back to tract-onnx.
+            let attempt = || -> Result<Self> {
+                let session = crate::openvino_backend::OpenVinoSession::from_onnx(model_path, ov)?;
+                log::info!(
+                    "Ultra-Light detector loaded via OpenVINO on {}",
+                    session.device()
+                );
+                let shape = &session.input_shape;
+                let height = shape
+                    .get(2)
+                    .copied()
+                    .context("Cannot get input height from OpenVINO model")?
+                    as usize;
+                let width = shape
+                    .get(3)
+                    .copied()
+                    .context("Cannot get input width from OpenVINO model")?
+                    as usize;
+                Ok(Self {
+                    backend: UltraLightBackend::OpenVino(session),
+                    width,
+                    height,
+                    prob_threshold,
+                    nms_threshold,
+                })
+            };
+            match attempt() {
+                Ok(detector) => return Ok(detector),
                 Err(e) => {
                     warn!("OpenVINO detector init failed: {e}. Falling back to tract-onnx.");
                 }
@@ -223,12 +227,12 @@ impl UltraLightDetector {
                 (scores, boxes)
             }
             UltraLightBackend::Tract(model) => {
-                let outputs = model.run(tvec!(input.into_tensor().into()))?;
+                let outputs = model.run(tvec!(input.into_tvalue()))?;
                 if outputs.len() < 2 {
                     anyhow::bail!("Ultra-Light tract model returned fewer than 2 outputs");
                 }
-                let scores_view = outputs[0].to_array_view::<f32>()?;
-                let boxes_view = outputs[1].to_array_view::<f32>()?;
+                let scores_view = outputs[0].to_plain_array_view::<f32>()?;
+                let boxes_view = outputs[1].to_plain_array_view::<f32>()?;
                 let scores = scores_view.iter().copied().collect::<Vec<f32>>();
                 let boxes = boxes_view.iter().copied().collect::<Vec<f32>>();
                 (scores, boxes)
@@ -392,6 +396,335 @@ impl YuNetDetector {
     }
 }
 
+/// SCRFD face detector (InsightFace): 3 FPN levels (strides 8/16/32), 2 anchors
+/// per cell and optional 5-point landmarks. Beats YuNet on WIDER FACE at a
+/// comparable size and, unlike Haar, is IR-friendly.
+///
+/// The network takes a square letterboxed input (`detection.scrfd_input_size`,
+/// default 640), so 16:9 IR frames keep their geometry; detections and
+/// landmarks are mapped back through the letterbox scale. Preprocessing follows
+/// the reference implementation: RGB, `(p − 127.5) / 128`, black padding.
+pub struct ScrfdDetector {
+    backend: ScrfdBackend,
+    input_size: i32,
+    prob_threshold: f32,
+    nms_threshold: f32,
+}
+
+enum ScrfdBackend {
+    #[cfg(feature = "openvino")]
+    OpenVino(crate::openvino_backend::OpenVinoSession),
+    Tract(OnnxModel),
+}
+
+impl ScrfdDetector {
+    pub fn load(
+        model_path: &str,
+        input_size: i32,
+        prob_threshold: f32,
+        nms_threshold: f32,
+        use_openvino: bool,
+        ov: &OpenVinoConfig,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "openvino"))]
+        let _ = (use_openvino, ov);
+        let path = Path::new(model_path);
+        if !path.exists() {
+            anyhow::bail!("Model not found: {}", model_path);
+        }
+        // The decoder only understands strides 8/16/32, so round up to /32.
+        let input_size = scrfd_input_size(input_size);
+
+        #[cfg(feature = "openvino")]
+        if use_openvino {
+            let side = i64::from(input_size);
+            match crate::openvino_backend::OpenVinoSession::from_onnx_static_input(
+                model_path, ov, side, side,
+            ) {
+                Ok(session) => {
+                    log::info!("SCRFD detector loaded via OpenVINO on {}", session.device());
+                    return Ok(Self {
+                        backend: ScrfdBackend::OpenVino(session),
+                        input_size,
+                        prob_threshold,
+                        nms_threshold,
+                    });
+                }
+                Err(e) => warn!("OpenVINO SCRFD init failed: {e}. Falling back to tract-onnx."),
+            }
+        }
+
+        let model = tract_onnx::onnx()
+            .model_for_path(path)
+            .context("Failed to read ONNX model")?
+            .with_input_fact(0, f32::fact([1, 3, input_size, input_size]).into())
+            .context("Failed to set SCRFD input fact")?
+            .into_optimized()
+            .context("Failed to optimize ONNX model")?
+            .into_runnable()
+            .context("Failed to create ONNX runnable model")?;
+        log::info!("SCRFD detector loaded via tract-onnx (CPU)");
+        Ok(Self {
+            backend: ScrfdBackend::Tract(model),
+            input_size,
+            prob_threshold,
+            nms_threshold,
+        })
+    }
+
+    pub fn detect(&mut self, image: &Mat) -> Result<Vec<Face>> {
+        let (cols, rows) = (image.cols(), image.rows());
+        if cols <= 0 || rows <= 0 {
+            anyhow::bail!("Empty frame");
+        }
+        let (new_w, new_h) = letterbox_fit(cols, rows, self.input_size);
+        let input = self.preprocess(image, new_w, new_h)?;
+
+        let outputs = match &mut self.backend {
+            #[cfg(feature = "openvino")]
+            ScrfdBackend::OpenVino(session) => {
+                session.run(input).context("OpenVINO inference failed")?
+            }
+            ScrfdBackend::Tract(model) => {
+                let tensors = model.run(tvec!(input.into_tvalue()))?;
+                tensors
+                    .iter()
+                    .map(|t| {
+                        let view = t.to_plain_array_view::<f32>()?;
+                        let dims = view.shape().iter().map(|&d| d as i64).collect();
+                        Ok((dims, view.iter().copied().collect::<Vec<f32>>()))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+
+        // Undo the letterbox: canvas x = orig x * sx, canvas y = orig y * sy.
+        let (sx, sy) = (new_w as f32 / cols as f32, new_h as f32 / rows as f32);
+        let faces = scrfd_decode(
+            &outputs,
+            self.input_size,
+            self.prob_threshold,
+            sx,
+            sy,
+            cols,
+            rows,
+        )?;
+        Ok(nms(faces, self.nms_threshold))
+    }
+
+    fn preprocess(&self, image: &Mat, new_w: i32, new_h: i32) -> Result<Array4<f32>> {
+        let mut resized = Mat::default();
+        opencv::imgproc::resize(
+            image,
+            &mut resized,
+            Size::new(new_w, new_h),
+            0.0,
+            0.0,
+            opencv::imgproc::INTER_AREA,
+        )?;
+        let mut rgb = Mat::default();
+        opencv::imgproc::cvt_color(
+            &resized,
+            &mut rgb,
+            opencv::imgproc::COLOR_BGR2RGB,
+            0,
+            AlgorithmHint::ALGO_HINT_DEFAULT,
+        )?;
+        if !rgb.is_continuous() {
+            rgb = rgb.try_clone()?;
+        }
+        let pixels = rgb.data_bytes()?;
+        if pixels.len() < (new_w * new_h * 3) as usize {
+            anyhow::bail!("Unexpected pixel buffer size after SCRFD preprocessing");
+        }
+
+        let size = self.input_size as usize;
+        // Black padding in *pixel* space, exactly like the reference code.
+        let pad = -127.5f32 / 128.0;
+        let mut input = Array4::<f32>::from_elem((1, 3, size, size), pad);
+        let (nw, nh) = (new_w as usize, new_h as usize);
+        for y in 0..nh {
+            for x in 0..nw {
+                let idx = (y * nw + x) * 3;
+                input[[0, 0, y, x]] = (pixels[idx] as f32 - 127.5) / 128.0;
+                input[[0, 1, y, x]] = (pixels[idx + 1] as f32 - 127.5) / 128.0;
+                input[[0, 2, y, x]] = (pixels[idx + 2] as f32 - 127.5) / 128.0;
+            }
+        }
+        Ok(input)
+    }
+
+    pub fn backend_info(&self) -> String {
+        match &self.backend {
+            #[cfg(feature = "openvino")]
+            ScrfdBackend::OpenVino(session) => format!("OpenVINO ({})", session.device()),
+            ScrfdBackend::Tract(_) => "tract-onnx (CPU)".to_string(),
+        }
+    }
+}
+
+/// SCRFD input side: at least 64 and divisible by the smallest stride (32).
+fn scrfd_input_size(requested: i32) -> i32 {
+    let requested = requested.max(64);
+    (requested + 31) / 32 * 32
+}
+
+/// Aspect-preserving fit of `cols × rows` into a `size × size` canvas.
+/// Returns the canvas size (top-left aligned; the rest stays black).
+fn letterbox_fit(cols: i32, rows: i32, size: i32) -> (i32, i32) {
+    let scale = (size as f32 / cols as f32).min(size as f32 / rows as f32);
+    let new_w = ((cols as f32 * scale).round() as i32).clamp(1, size);
+    let new_h = ((rows as f32 * scale).round() as i32).clamp(1, size);
+    (new_w, new_h)
+}
+
+/// One SCRFD feature level: `rows = (input_size / stride)² × anchors`
+/// predictions of `width` values each.
+struct ScrfdLevel<'a> {
+    stride: i32,
+    anchors: usize,
+    rows: usize,
+    data: &'a [f32],
+}
+
+/// Map a level's prediction count back to `(stride, anchors)`.
+fn scrfd_level(rows: usize, input_size: i32) -> Option<(i32, usize)> {
+    [8, 16, 32, 64, 128].into_iter().find_map(|stride| {
+        let cells = (input_size / stride) as usize;
+        let cells = cells * cells;
+        [1usize, 2]
+            .into_iter()
+            .find(|anchors| cells * *anchors == rows)
+            .map(|anchors| (stride, anchors))
+    })
+}
+
+/// Group flat model outputs into SCRFD levels by their trailing dimension:
+/// 1 = scores, 4 = bbox distances, 10 = 5 landmarks, sorted by stride.
+/// Unknown trailing dimensions are ignored so a re-export with extra heads
+/// still works.
+fn scrfd_levels<'a>(
+    outputs: &'a [(Vec<i64>, Vec<f32>)],
+    input_size: i32,
+    width: usize,
+) -> Result<Vec<ScrfdLevel<'a>>> {
+    let mut levels = Vec::new();
+    for (dims, data) in outputs {
+        if dims.last().copied() != Some(width as i64) || data.is_empty() {
+            continue;
+        }
+        let rows = data.len() / width;
+        let (stride, anchors) = scrfd_level(rows, input_size).with_context(|| {
+            format!("Unexpected SCRFD output of {rows} rows for a {input_size}px input")
+        })?;
+        levels.push(ScrfdLevel {
+            stride,
+            anchors,
+            rows,
+            data,
+        });
+    }
+    levels.sort_by_key(|l| l.stride);
+    Ok(levels)
+}
+
+/// Decode SCRFD outputs to faces in original-frame coordinates.
+///
+/// `sx`/`sy` map canvas → frame (`new / original`), `clip_w`/`clip_h` bound the
+/// result. Follows `insightface.model_zoo.scrfd`: anchor centers at multiples of
+/// the stride (two anchors per cell, cell-major), distances scaled by the stride.
+fn scrfd_decode(
+    outputs: &[(Vec<i64>, Vec<f32>)],
+    input_size: i32,
+    prob_threshold: f32,
+    sx: f32,
+    sy: f32,
+    clip_w: i32,
+    clip_h: i32,
+) -> Result<Vec<Face>> {
+    let scores = scrfd_levels(outputs, input_size, 1)?;
+    let boxes = scrfd_levels(outputs, input_size, 4)?;
+    let kps = scrfd_levels(outputs, input_size, 10)?;
+    if scores.is_empty() {
+        anyhow::bail!("SCRFD model returned no score outputs");
+    }
+    if boxes.len() != scores.len() {
+        anyhow::bail!(
+            "SCRFD output mismatch: {} score levels, {} bbox levels",
+            scores.len(),
+            boxes.len()
+        );
+    }
+    if !kps.is_empty() && kps.len() != scores.len() {
+        anyhow::bail!(
+            "SCRFD output mismatch: {} score levels, {} landmark levels",
+            scores.len(),
+            kps.len()
+        );
+    }
+
+    let mut faces = Vec::new();
+    for (i, score) in scores.iter().enumerate() {
+        let bbox = &boxes[i];
+        if bbox.data.len() < score.rows * 4 {
+            anyhow::bail!("SCRFD bbox level has too few values");
+        }
+        let landmarks_level = kps.get(i);
+        if let Some(kps) = landmarks_level
+            && kps.data.len() < score.rows * 10
+        {
+            anyhow::bail!("SCRFD landmark level has too few values");
+        }
+
+        let stride = score.stride as f32;
+        let grid = (input_size / score.stride) as usize;
+        for row in 0..score.rows {
+            let conf = score.data[row];
+            if conf < prob_threshold {
+                continue;
+            }
+            let cell = row / score.anchors;
+            // Anchor centers sit at multiples of the stride (reference decode).
+            let cx = ((cell % grid) as f32) * stride;
+            let cy = ((cell / grid) as f32) * stride;
+
+            let d = &bbox.data[row * 4..row * 4 + 4];
+            let x1 = ((cx - d[0] * stride) / sx).clamp(0.0, clip_w as f32);
+            let y1 = ((cy - d[1] * stride) / sy).clamp(0.0, clip_h as f32);
+            let x2 = ((cx + d[2] * stride) / sx).clamp(0.0, clip_w as f32);
+            let y2 = ((cy + d[3] * stride) / sy).clamp(0.0, clip_h as f32);
+            let (x1, y1, x2, y2) = (
+                x1.round() as i32,
+                y1.round() as i32,
+                x2.round() as i32,
+                y2.round() as i32,
+            );
+            if x2 - x1 < 1 || y2 - y1 < 1 {
+                continue;
+            }
+
+            let landmarks = landmarks_level.map(|kps| {
+                (0..5)
+                    .map(|j| {
+                        let off = row * 10 + j * 2;
+                        Point2f::new(
+                            (cx + kps.data[off] * stride) / sx,
+                            (cy + kps.data[off + 1] * stride) / sy,
+                        )
+                    })
+                    .collect()
+            });
+
+            faces.push(Face::with_landmarks(
+                Rect::new(x1, y1, x2 - x1, y2 - y1),
+                conf,
+                landmarks.unwrap_or_default(),
+            ));
+        }
+    }
+    Ok(faces)
+}
+
 /// Fallback face detector using OpenCV Haar cascades
 pub struct HaarCascadeDetector {
     classifier: cascade::CascadeClassifier,
@@ -444,6 +777,7 @@ pub enum Detector {
     Haar(HaarCascadeDetector),
     Cnn(Box<UltraLightDetector>),
     YuNet(YuNetDetector),
+    Scrfd(ScrfdDetector),
 }
 
 impl Detector {
@@ -452,6 +786,7 @@ impl Detector {
             Detector::Haar(_) => "Haar cascade (CPU)".to_string(),
             Detector::Cnn(d) => format!("Ultra-Light ({})", d.backend_info()),
             Detector::YuNet(_) => "YuNet (OpenCV DNN)".to_string(),
+            Detector::Scrfd(d) => format!("SCRFD ({})", d.backend_info()),
         }
     }
 
@@ -460,12 +795,13 @@ impl Detector {
             Detector::Haar(d) => d.detect(image),
             Detector::Cnn(d) => d.detect(image),
             Detector::YuNet(d) => d.detect(image),
+            Detector::Scrfd(d) => d.detect(image),
         }
     }
 }
 
-/// Pick a detector: YuNet whenever `yunet_path` is set and loads (independent of
-/// `use_cnn`), then Ultra-Light if `use_cnn`, then the Haar cascade.
+/// Pick a detector: SCRFD whenever `scrfd_path` is set and loads, then YuNet,
+/// then Ultra-Light if `use_cnn`, then the Haar cascade.
 /// `ir_mode` relaxes Haar `minNeighbors` from 3 to 2.
 pub fn create_detector(
     cfg: &DetectionConfig,
@@ -474,6 +810,31 @@ pub fn create_detector(
 ) -> Result<Detector> {
     let confidence = cfg.confidence_threshold as f32;
     let nms_threshold = cfg.nms_threshold as f32;
+
+    if !cfg.scrfd_path.is_empty() {
+        if !Path::new(&cfg.scrfd_path).exists() {
+            warn!("SCRFD model {} not found; trying YuNet", cfg.scrfd_path);
+        } else {
+            match ScrfdDetector::load(
+                &cfg.scrfd_path,
+                cfg.scrfd_input_size,
+                confidence,
+                nms_threshold,
+                cfg.use_openvino,
+                ov,
+            ) {
+                Ok(d) => {
+                    log::info!(
+                        "Using SCRFD face detector with landmarks ({}, {})",
+                        cfg.scrfd_path,
+                        d.backend_info()
+                    );
+                    return Ok(Detector::Scrfd(d));
+                }
+                Err(e) => warn!("SCRFD {} failed to load ({e})", cfg.scrfd_path),
+            }
+        }
+    }
 
     if !cfg.yunet_path.is_empty() {
         for path in yunet_candidates(&cfg.yunet_path) {
@@ -658,6 +1019,98 @@ mod tests {
         f.landmarks[2].y -= 16.0;
         assert!(estimate_pitch(&f).unwrap() < -10.0);
         assert!(estimate_pitch(&Face::new(Rect::new(0, 0, 1, 1), 1.0)).is_none());
+    }
+
+    /// Build a flat SCRFD output set with a single detection at a known cell.
+    fn scrfd_outputs(input_size: i32, stride: i32, conf: f32) -> Vec<(Vec<i64>, Vec<f32>)> {
+        let grid = (input_size / stride) as usize;
+        let anchors = 2usize;
+        let rows = grid * grid * anchors;
+        let cell = grid * grid / 2 + grid / 2;
+        let row = cell * anchors; // first anchor of the middle cell
+        let cx = (cell % grid) as f32 * stride as f32;
+        let cy = (cell / grid) as f32 * stride as f32;
+        let _ = (cx, cy);
+
+        let mut scores = vec![0.0f32; rows];
+        scores[row] = conf;
+        let mut bboxes = vec![0.0f32; rows * 4];
+        bboxes[row * 4..row * 4 + 4].copy_from_slice(&[2.0, 2.0, 2.0, 2.0]);
+        let mut kps = vec![0.0f32; rows * 10];
+        for (j, v) in [-2.0f32, -1.0, 0.0, 1.0, 2.0].iter().enumerate() {
+            kps[row * 10 + j * 2] = *v;
+            kps[row * 10 + j * 2 + 1] = *v;
+        }
+        vec![
+            (vec![rows as i64, 1], scores),
+            (vec![rows as i64, 4], bboxes),
+            (vec![rows as i64, 10], kps),
+        ]
+    }
+
+    #[test]
+    fn scrfd_input_size_rounds_up_to_stride() {
+        assert_eq!(scrfd_input_size(640), 640);
+        assert_eq!(scrfd_input_size(641), 672);
+        assert_eq!(scrfd_input_size(10), 64);
+        assert_eq!(scrfd_input_size(0), 64);
+    }
+
+    #[test]
+    fn letterbox_preserves_aspect() {
+        assert_eq!(letterbox_fit(1644, 2052, 640), (513, 640));
+        assert_eq!(letterbox_fit(2052, 1644, 640), (640, 513));
+        assert_eq!(letterbox_fit(640, 640, 640), (640, 640));
+        let (w, h) = letterbox_fit(100, 1000, 640);
+        assert_eq!((w, h), (64, 640));
+    }
+
+    #[test]
+    fn scrfd_levels_group_by_stride() {
+        let outputs = scrfd_outputs(64, 8, 0.9);
+        let scores = scrfd_levels(&outputs, 64, 1).unwrap();
+        assert_eq!(scores.len(), 1);
+        assert_eq!(
+            (scores[0].stride, scores[0].anchors, scores[0].rows),
+            (8, 2, 128)
+        );
+        // The 4-wide and 10-wide heads group separately.
+        assert_eq!(scrfd_levels(&outputs, 64, 4).unwrap().len(), 1);
+        assert_eq!(scrfd_levels(&outputs, 64, 10).unwrap().len(), 1);
+        // An output width the model does not produce is ignored.
+        assert!(scrfd_levels(&outputs, 64, 3).unwrap().is_empty());
+        // Row counts that fit no known (stride, anchors) pair are an error.
+        let bad = vec![(vec![7_i64, 1], vec![0.5f32; 7])];
+        assert!(scrfd_levels(&bad, 64, 1).is_err());
+    }
+
+    #[test]
+    fn scrfd_decodes_box_and_landmarks() {
+        let outputs = scrfd_outputs(64, 8, 0.9);
+        let faces = scrfd_decode(&outputs, 64, 0.5, 1.0, 1.0, 64, 64).unwrap();
+        assert_eq!(faces.len(), 1);
+        let f = &faces[0];
+        assert!((f.confidence - 0.9).abs() < 1e-6);
+        // middle cell of an 8×8 grid: center (32, 32), distance 2 × stride 8
+        assert_eq!(f.bbox, Rect::new(16, 16, 32, 32));
+        assert_eq!(f.landmarks.len(), 5);
+        assert!((f.landmarks[0].x - 16.0).abs() < 1e-4);
+        assert!((f.landmarks[4].x - 48.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn scrfd_respects_threshold_and_scaling() {
+        let outputs = scrfd_outputs(64, 8, 0.4);
+        assert!(
+            scrfd_decode(&outputs, 64, 0.5, 1.0, 1.0, 64, 64)
+                .unwrap()
+                .is_empty()
+        );
+
+        // sx/sy map canvas → frame: halving them doubles the reported box.
+        let outputs = scrfd_outputs(64, 8, 0.9);
+        let faces = scrfd_decode(&outputs, 64, 0.5, 0.5, 0.5, 128, 128).unwrap();
+        assert_eq!(faces[0].bbox, Rect::new(32, 32, 64, 64));
     }
 
     #[test]

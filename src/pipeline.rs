@@ -134,10 +134,10 @@ fn face_verdict(
     Ok(FaceVerdict::Ok)
 }
 
-/// Aligned 112×112 face when landmarks exist (YuNet), padded crop otherwise.
-pub fn face_crop(color: &Mat, face: &Face, cfg: &DetectionConfig) -> Result<Mat> {
+/// Aligned `output_size` face when 5-point landmarks exist (SCRFD, YuNet), padded crop otherwise.
+pub fn face_crop(color: &Mat, face: &Face, cfg: &DetectionConfig, output_size: i32) -> Result<Mat> {
     if face.landmarks.len() >= 2 {
-        align_face(color, &face.landmarks, 112)
+        align_face(color, &face.landmarks, output_size)
     } else {
         crop_face(color, &face.bbox, cfg.face_padding)
     }
@@ -192,7 +192,12 @@ impl Pipeline {
     pub fn embed(&mut self, frame: &Frame, cfg: &Config) -> Result<Option<FaceEmbedding>> {
         match (&frame.analysis.face, frame.analysis.verdict) {
             (Some(face), FaceVerdict::Ok) => {
-                let crop = face_crop(&frame.color, face, &cfg.detection)?;
+                let crop = face_crop(
+                    &frame.color,
+                    face,
+                    &cfg.detection,
+                    cfg.recognition.input_size as i32,
+                )?;
                 Ok(Some(self.recognizer.extract(&crop)?))
             }
             _ => Ok(None),

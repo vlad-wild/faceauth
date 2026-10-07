@@ -6,9 +6,9 @@ FaceAuth is a Linux facial authentication system written in Rust, inspired by [H
 
 ## Features
 
-- **Face detection** with YuNet (5 landmarks, preferred), Ultra-Light or a Haar cascade fallback. YuNet runs at each frame's own size, so 16:9 IR frames are not stretched.
+- **Face detection** with SCRFD-2.5GF (5 landmarks, preferred), then YuNet, Ultra-Light or a Haar cascade as fallbacks. SCRFD letterboxes the frame into a square canvas, so 16:9 IR frames are not stretched; YuNet runs at each frame's own size.
 - **Alignment** via a 5-point least-squares affine transform to the InsightFace canonical pose.
-- **Embeddings** from MobileFaceNet via OpenVINO (NPU / GPU / CPU) or tract-onnx on CPU.
+- **Embeddings** from EdgeFace-S (512-dim) via OpenVINO (NPU / GPU / CPU) or tract-onnx on CPU; MobileFaceNet is still supported through `[recognition]`.
 - **Fail-closed matching**: no substitute embeddings when the model is missing or inference fails; the recognizer fingerprint is stored with enrolled samples and checked on every attempt.
 - **Robust decisions**: `required_matches` consecutive matching frames, score = mean of the `top_k` nearest samples, optional IR liveness gate against screens.
 - **Quality-checked enrollment**: blur and pose filters, near-duplicate rejection, and guidance to cover left / frontal / right head poses.
@@ -136,7 +136,7 @@ A model has a **primary** sample set and named **variants** (e.g. `glasses`); au
 
 If frames are black, the IR emitter is probably off: try [linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter). `ir_mode` disables the darkness filter and relaxes Haar. With `[liveness] ir_check`, faces that are too dark or flat in IR (screens) are rejected; `faceauth calibrate` prints your face brightness so you can tune `min_face_brightness` / `min_face_stddev`.
 
-MobileFaceNet was trained mostly on RGB, so IR scores are usually higher — calibrate instead of guessing a threshold.
+EdgeFace was trained mostly on RGB, so IR scores are usually different — calibrate instead of guessing a threshold.
 
 ## OpenVINO / Intel NPU
 
@@ -150,7 +150,8 @@ cache_dir = "/var/cache/faceauth/openvino"
 
 - `AUTO` uses NPU/GPU when present and starts on CPU while the accelerator compiles the model, which matters because `faceauth-auth` starts fresh on every `sudo`. Without accelerators it uses plain CPU.
 - Compiled models are cached in `cache_dir` (falls back to `~/.cache/faceauth/openvino` when not writable), so later attempts skip compilation.
-- `faceauth doctor` shows the device actually used and load / first-inference times, also on CPU for comparison. Small models like MobileFaceNet are fast on CPU too; the NPU pays off once the cache is warm.
+- `faceauth doctor` shows the device actually used and load / first-inference times, also on CPU for comparison. Small models like EdgeFace are fast on CPU too; the NPU pays off once the cache is warm.
+- Models exported with a dynamic input shape (EdgeFace's `batch_size`, SCRFD's `H`/`W`) are reshaped to a static `[1, 3, H, W]` before compiling — the NPU compiler crashes on partially dynamic graphs otherwise.
 - Install the runtime from the AUR (`openvino` or `openvino-bin`); the crate links it at runtime.
 
 Enrollment and authentication may use different devices (same model file), but scores can differ slightly.
@@ -170,9 +171,18 @@ The window captures as your user; saving and checking go through `pkexec faceaut
 
 See the commented [packaging/config.toml](packaging/config.toml). Every key is optional. The CLI and GUI look for `./faceauth.toml` → `~/.config/faceauth/config.toml` → `/etc/faceauth/config.toml`; as root only `/etc/faceauth/config.toml` is used. Relative model paths resolve against the config file's directory; missing ones fall back to `/usr/share/faceauth/models`.
 
-YuNet: `face_detection_yunet_2023mar.onnx` is shipped and works on OpenCV 4.x and 5.0 (checked on Arch's OpenCV 5.0 with per-frame input sizes). A `2026may` export (dynamic input shape) can be configured instead; if it fails to load, the `2023mar` file next to it is used.
+Detection order is SCRFD → YuNet → Ultra-Light → Haar: `create_detector` takes the first model that loads, so a missing `scrfd_path` simply falls back to the old stack.
+
+- `scrfd_2.5g_kps.onnx` (SCRFD-2.5GF with landmarks) is shipped for detection; `scrfd_input_size` (default 640, rounded up to a multiple of 32) sets its input.
+- `edgeface_s_gamma_05.onnx` (EdgeFace-S, 512-dim) is the default recognizer. `[recognition] normalization` must match the model: `"unit"` for EdgeFace, `"insightface"` for MobileFaceNet/ArcFace; an unknown value fails closed instead of silently mis-normalizing.
+- YuNet: `face_detection_yunet_2023mar.onnx` is shipped and works on OpenCV 4.x and 5.0 (checked on Arch's OpenCV 5.0 with per-frame input sizes). A `2026may` export (dynamic input shape) can be configured instead; if it fails to load, the `2023mar` file next to it is used.
 
 `dark_threshold` is `100 − mean brightness` in percent: the default 85 only skips RGB frames with a mean brightness below ~38/255.
+
+## Upgrading from 0.3 (new models)
+
+- 0.4 switches to SCRFD detection + EdgeFace recognition. Embeddings from a different recognizer are **not** comparable, so re-enroll every user: `sudo faceauth add -u "$USER"`, then `sudo faceauth calibrate -u "$USER"`.
+- Old configs keep working without edits: they keep YuNet/MobileFaceNet (the new keys default to the old behaviour); add the new keys from [packaging/config.toml](packaging/config.toml) to switch.
 
 ## Upgrading from 0.2
 
@@ -189,7 +199,7 @@ src/
 ├── camera.rs            # V4L2 capture, rotation, scaling, ROI statistics
 ├── config.rs            # TOML config, discovery, defaults
 ├── database.rs          # models, merge logic, root-only storage, GUI payloads
-├── detection.rs         # YuNet / Ultra-Light / Haar, NMS, clipping, pose estimates
+├── detection.rs         # SCRFD / YuNet / Ultra-Light / Haar, NMS, clipping, pose estimates
 ├── devices.rs           # /dev/video* discovery
 ├── diagnostics.rs       # `doctor` result types
 ├── doctor.rs            # `faceauth doctor`
