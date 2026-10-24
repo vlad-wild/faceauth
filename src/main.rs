@@ -577,6 +577,11 @@ fn calibrate(cfg: &Config, user: &str, frames: usize) -> Result<()> {
     let mut pipeline = Pipeline::open(cfg, &cfg.video.device_path)?;
     let k = cfg.recognition.top_k;
     eprintln!("Look at the camera as you normally would when logging in…");
+    // A hint used to be replaced by the very next frame (camera rate) and
+    // flickered unreadable. Pin a fresh hint for HINT_DWELL with the counter
+    // appended; an unchanged hint is not reprinted, so nothing flickers.
+    const HINT_DWELL: Duration = Duration::from_secs(2);
+    let mut hint: Option<(&'static str, Instant)> = None;
     let result = calibration::calibrate(
         &mut pipeline,
         cfg,
@@ -585,9 +590,21 @@ fn calibrate(cfg: &Config, user: &str, frames: usize) -> Result<()> {
         Duration::from_secs(60),
         |p| {
             match p {
-                calibration::Progress::Scored { n, of } => eprint!("\r\x1b[2K{n}/{of}"),
+                calibration::Progress::Scored { n, of } => match hint {
+                    Some((h, at)) if at.elapsed() < HINT_DWELL => {
+                        eprint!("\r\x1b[2K{} · {n}/{of}", t(h))
+                    }
+                    _ => {
+                        hint = None;
+                        eprint!("\r\x1b[2K{n}/{of}")
+                    }
+                },
                 calibration::Progress::Rejected(v) => {
-                    eprint!("\r\x1b[2K{}", t(v.message_key()))
+                    let h = v.message_key();
+                    if hint.is_none_or(|(shown, _)| shown != h) {
+                        hint = Some((h, Instant::now()));
+                        eprint!("\r\x1b[2K{}", t(h));
+                    }
                 }
             }
             ControlFlow::Continue(())
