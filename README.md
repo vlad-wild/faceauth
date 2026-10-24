@@ -92,7 +92,7 @@ auth  sufficient  pam_exec.so quiet /usr/bin/faceauth-auth
 
 ### Screen lockers and `faceauthd`
 
-`sudo`, polkit and login managers run PAM as root, so `faceauth-auth` reads the model store and opens the camera itself. Screen lockers (swaylock, hyprlock, Quickshell lockers…) run as **your user** and cannot read the root-only store. For them, enable the daemon:
+`sudo`, polkit and login managers run PAM as root, so `faceauth-auth` reads the model store and opens the camera itself. Recent polkit (e.g. 128) runs its PAM stack in a sandboxed unit with no devices (`polkit-agent-helper@.service`); there `faceauth-auth` asks the daemon below instead, so polkit prompts need it too. Screen lockers (swaylock, hyprlock, Quickshell lockers…) run as **your user** and cannot read the root-only store. For them, enable the daemon:
 
 ```bash
 sudo systemctl enable --now faceauthd.socket

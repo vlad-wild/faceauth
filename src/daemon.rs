@@ -252,10 +252,12 @@ pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Result<u32> {
     Ok(cred.uid)
 }
 
-/// Ask the daemon to verify the calling user's face, reporting every event.
+/// Ask the daemon to verify the calling user's face (or `user`'s, root only),
+/// reporting every event.
 #[cfg(unix)]
 pub fn verify(
     socket: &Path,
+    user: Option<&str>,
     service: Option<&str>,
     mut on_event: impl FnMut(&Event),
 ) -> Result<(Outcome, Option<String>)> {
@@ -267,7 +269,7 @@ pub fn verify(
     // Longer than any configured timeout: the daemon always ends with a result.
     stream.set_read_timeout(Some(Duration::from_secs(90)))?;
     let mut request = serde_json::to_string(&Request::Verify {
-        user: None,
+        user: user.map(str::to_string),
         service: service.map(str::to_string),
     })?;
     request.push('\n');

@@ -3,7 +3,8 @@
 //! As root (sudo, polkit, login managers) it opens the camera itself. Run by an
 //! unprivileged screen locker it cannot read the root-only model store, so it asks
 //! `faceauthd` to verify the calling user instead, and only when PAM is
-//! authenticating that same user.
+//! authenticating that same user. Root without the camera (polkit's sandboxed
+//! agent helper) asks `faceauthd` too, naming the PAM user.
 //!
 //! Exit codes (anything but 0 lets PAM fall through to the password):
 //! * 0  — face matched
@@ -88,29 +89,35 @@ fn main() {
     std::process::exit(code);
 }
 
-/// Unprivileged mode: let `faceauthd` verify the calling user.
+/// Let `faceauthd` verify `user`. Unprivileged (screen lockers) the daemon verifies
+/// the calling user, so only accept that when PAM is authenticating the same
+/// account; root names the user (sandboxed root, see [`camera_node`]).
 fn run_via_daemon(user: &str) -> i32 {
     if session::is_remote_pam_session() {
         log::info!("Remote session (PAM_RHOST/PAM_TTY); skipping face authentication");
         return EXIT_SKIPPED;
     }
-    // The daemon verifies whoever owns this process. Only accept that result
-    // when PAM is authenticating the same account.
-    // SAFETY: getuid has no preconditions.
-    let uid = unsafe { libc::getuid() };
-    match username_for_uid(uid) {
-        Ok(own) if own == user => {}
-        Ok(own) => {
-            log::warn!("PAM user {user} is not the calling user {own}; skipping");
-            return EXIT_SKIPPED;
+    let named = if is_root() {
+        Some(user)
+    } else {
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        match username_for_uid(uid) {
+            Ok(own) if own == user => {}
+            Ok(own) => {
+                log::warn!("PAM user {user} is not the calling user {own}; skipping");
+                return EXIT_SKIPPED;
+            }
+            Err(e) => {
+                log::error!("{e:#}");
+                return EXIT_SETUP_ERROR;
+            }
         }
-        Err(e) => {
-            log::error!("{e:#}");
-            return EXIT_SETUP_ERROR;
-        }
-    }
+        None
+    };
     match daemon::verify(
         Path::new(SOCKET_PATH),
+        named,
         env::var("PAM_SERVICE").ok().as_deref(),
         |_| {},
     ) {
@@ -125,6 +132,14 @@ fn run_via_daemon(user: &str) -> i32 {
             log::error!("{e:#}");
             EXIT_SETUP_ERROR
         }
+    }
+}
+
+/// Device node behind `video.device_path`, which may also be a bare index (`2`).
+fn camera_node(device: &str) -> PathBuf {
+    match device.parse::<u32>() {
+        Ok(index) => PathBuf::from(format!("/dev/video{index}")),
+        Err(_) => PathBuf::from(device),
     }
 }
 
@@ -146,6 +161,14 @@ fn run(args: Args) -> Result<i32> {
 
     let config = Config::load_resolved(&args.config)
         .with_context(|| format!("Failed to load config {}", args.config.display()))?;
+
+    // Recent polkit (128) runs PAM in a sandboxed unit (polkit-agent-helper@.service,
+    // PrivateDevices=yes): root, but no camera. faceauthd still has it.
+    let camera = camera_node(&config.video.device_path);
+    if !camera.exists() && Path::new(SOCKET_PATH).exists() {
+        log::info!("{} is not visible here; asking faceauthd", camera.display());
+        return Ok(run_via_daemon(&user));
+    }
 
     let model = match pre_auth_checks(&config, &user, session::is_remote_pam_session())? {
         Gate::Proceed(model) => model,
