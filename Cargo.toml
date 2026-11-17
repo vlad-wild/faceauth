@@ -7,7 +7,7 @@ license = "MIT"
 authors = ["Vlad Wild <ya.vlash1@yandex.ru>"]
 
 [dependencies]
-opencv = { version = "0.101", default-features = false, features = ["clang-runtime", "imgproc", "videoio", "objdetect", "xobjdetect"] }
+opencv = { version = "0.102", default-features = false, features = ["clang-runtime", "imgproc", "videoio", "objdetect", "xobjdetect"] }
 ndarray = "0.17"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
