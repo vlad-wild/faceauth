@@ -71,6 +71,7 @@ struct Shared {
 }
 
 fn main() {
+    faceauth::pipeline::disable_npu_driver_cache();
     logger::init_from_env();
     if let Err(e) = run(Args::parse()) {
         log::error!("{e:#}");

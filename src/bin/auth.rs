@@ -77,6 +77,7 @@ fn resolve_pam_username(cli_user: Option<String>) -> Result<String, String> {
 }
 
 fn main() {
+    faceauth::pipeline::disable_npu_driver_cache();
     logger::init_from_env();
     let args = Args::parse();
     let code = match run(args) {

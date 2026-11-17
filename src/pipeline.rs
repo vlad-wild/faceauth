@@ -152,6 +152,19 @@ pub struct Frame {
     pub analysis: FrameAnalysis,
 }
 
+/// Turn off the NPU driver's own compiled-model cache; call first thing in
+/// `main`, before any thread starts. The driver keeps it in
+/// `$HOME/.cache/ze_intel_npu_cache`, or `./.cache/…` when HOME is unset (as
+/// under pam_exec), so every sudo left a root-owned directory wherever it ran.
+/// OpenVINO's CACHE_DIR already caches the compiled models, and the driver
+/// only reads this variable at load.
+pub fn disable_npu_driver_cache() {
+    if std::env::var_os("ZE_INTEL_NPU_CACHE_SIZE").is_none() {
+        // SAFETY: called at the start of `main`, while the process is single-threaded.
+        unsafe { std::env::set_var("ZE_INTEL_NPU_CACHE_SIZE", "0") };
+    }
+}
+
 /// Detector and recognizer without a camera.
 pub struct Models {
     pub detector: Detector,

@@ -1034,6 +1034,7 @@ fn view_setup(app: &App) -> Element<'_, Message> {
 }
 
 fn main() -> iced::Result {
+    faceauth::pipeline::disable_npu_driver_cache();
     // Interface font of the desktop, when its palette is installed.
     let font = if style::load().0.is_some() {
         Font::with_name("Space Grotesk")

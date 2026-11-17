@@ -186,6 +186,7 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    faceauth::pipeline::disable_npu_driver_cache();
     faceauth::logger::init_from_env();
     let cli = Cli::parse();
     let (cfg, source) = load_config(cli.config.as_deref())?;
